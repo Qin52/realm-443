@@ -21,6 +21,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -53,6 +54,9 @@ DEFAULT_FALLBACK = os.environ.get("GOST_FALLBACK", "127.0.0.1:8053")
 RELAY_HOST = os.environ.get("GSM_RELAY_HOST", "127.0.0.1")
 RELAY_PORT_MIN = int(os.environ.get("GSM_RELAY_PORT_MIN", "56000"))
 RELAY_PORT_MAX = int(os.environ.get("GSM_RELAY_PORT_MAX", "60999"))
+PANEL_PORT = int(os.environ.get("PANEL_PORT", os.environ.get("GOST_PANEL_PORT", "7080")))
+CADDY_HTTPS_PORT = int(os.environ.get("CADDY_HTTPS_PORT", "8053"))
+APPLY_DELAY = float(os.environ.get("GOST_APPLY_DELAY", "2.5"))
 PANEL_DOMAIN = os.environ.get("PANEL_DOMAIN", "").strip().lower()
 
 DOMAIN_RE = re.compile(r"^(?=.{1,253}$)([A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$")
@@ -151,8 +155,7 @@ def create_app() -> Flask:
             rule["relay_port"] = allocate_relay_port()
             insert_rule(rule)
             apply_config(restart=True)
-            sync_relay_service()
-            flash("规则已添加，并已应用配置。", "success")
+            flash("规则已添加，配置将在几秒内自动生效。", "success")
         except (ValueError, RuntimeError) as exc:
             flash(str(exc), "error")
         return redirect(url_for("dashboard"))
@@ -173,8 +176,7 @@ def create_app() -> Flask:
             new_rule = parse_rule_form(request.form, owner, actor=user, existing_rule=rule)
             update_rule_row(rule_id, new_rule)
             apply_config(restart=True)
-            sync_relay_service()
-            flash("规则已更新，并已应用配置。", "success")
+            flash("规则已更新，配置将在几秒内自动生效。", "success")
         except (ValueError, RuntimeError) as exc:
             flash(str(exc), "error")
         return redirect(url_for("dashboard"))
@@ -192,7 +194,6 @@ def create_app() -> Flask:
         execute("UPDATE rules SET enabled=?, updated_at=? WHERE id=?", (enabled, utc_now(), rule_id))
         try:
             apply_config(restart=True)
-            sync_relay_service()
             flash("规则状态已切换。", "success")
         except RuntimeError as exc:
             flash(f"状态已保存，但应用配置失败：{exc}", "error")
@@ -210,7 +211,6 @@ def create_app() -> Flask:
         execute("DELETE FROM rules WHERE id=?", (rule_id,))
         try:
             apply_config(restart=True)
-            sync_relay_service()
             flash("规则已删除。", "success")
         except RuntimeError as exc:
             flash(f"规则已删除，但应用配置失败：{exc}", "error")
@@ -276,7 +276,6 @@ def create_app() -> Flask:
             )
             clamp_user_rule_limits(user_id)
             apply_config(restart=True)
-            sync_relay_service()
             flash("子账号已更新。", "success")
         except (ValueError, RuntimeError) as exc:
             flash(str(exc), "error")
@@ -307,7 +306,6 @@ def create_app() -> Flask:
         execute("DELETE FROM rules WHERE owner_id=?", (user_id,))
         try:
             apply_config(restart=True)
-            sync_relay_service()
         except RuntimeError as exc:
             flash(f"账号已删除，但应用配置失败：{exc}", "error")
         else:
@@ -332,8 +330,7 @@ def create_app() -> Flask:
             set_setting("fallback_addr", fallback)
             set_setting("forwarding_mode", mode)
             apply_config(restart=True)
-            sync_relay_service()
-            flash("基础设置已保存。", "success")
+            flash("基础设置已保存，配置将在几秒内自动生效。", "success")
         except (ValueError, RuntimeError) as exc:
             flash(str(exc), "error")
         return redirect(url_for("dashboard"))
@@ -344,8 +341,7 @@ def create_app() -> Flask:
     def apply_now() -> Response:
         try:
             apply_config(restart=True)
-            sync_relay_service()
-            flash("已重新生成配置并重启服务。", "success")
+            flash("配置已重新生成，GOST 将在几秒内自动重启。", "success")
         except RuntimeError as exc:
             flash(f"应用失败：{exc}", "error")
         return redirect(url_for("dashboard"))
@@ -420,11 +416,53 @@ def init_db() -> None:
             );
             """
         )
+        migrate_schema(db)
         db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('listen',?)", (DEFAULT_LISTEN,))
         db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('fallback_addr',?)", (DEFAULT_FALLBACK,))
         db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('panel_domain',?)", (PANEL_DOMAIN,))
         db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('forwarding_mode', 'direct')")
         db.commit()
+
+
+def migrate_schema(db: sqlite3.Connection) -> None:
+    """Add columns introduced after the first release, keeping old databases usable."""
+    rule_columns = {row["name"] for row in db.execute("PRAGMA table_info(rules)").fetchall()}
+    if "listen_port" not in rule_columns:
+        db.execute("ALTER TABLE rules ADD COLUMN listen_port INTEGER NOT NULL DEFAULT 443")
+        db.commit()
+    db.execute(
+        "UPDATE rules SET listen_port=? WHERE listen_port IS NULL OR listen_port<=0",
+        (listen_port_of(get_setting("listen", DEFAULT_LISTEN)) or 443,),
+    )
+    db.commit()
+
+
+def default_listen_port() -> int:
+    return listen_port_of(get_setting("listen", DEFAULT_LISTEN)) or 443
+
+
+def listen_port_of(addr: str) -> Optional[int]:
+    """Extract the port from a GOST listen address such as ':443' or '1.2.3.4:8443'."""
+    addr = (addr or "").strip()
+    if not addr:
+        return None
+    try:
+        port = int(addr.rsplit(":", 1)[1])
+    except (ValueError, IndexError):
+        return None
+    return port if 1 <= port <= 65535 else None
+
+
+def validate_listen_port(port: int) -> None:
+    """Reject inbound ports that would fight with the panel, Caddy or the relay range."""
+    if not (1 <= port <= 65535):
+        raise ValueError("入站端口范围必须是 1-65535。")
+    if port == PANEL_PORT:
+        raise ValueError(f"入站端口 {port} 是面板自身端口，请换一个。")
+    if port == CADDY_HTTPS_PORT:
+        raise ValueError(f"入站端口 {port} 是 Caddy fallback 端口，请换一个。")
+    if RELAY_PORT_MIN <= port <= RELAY_PORT_MAX:
+        raise ValueError(f"入站端口不能落在本地中继保留段 {RELAY_PORT_MIN}-{RELAY_PORT_MAX} 内。")
 
 
 def row_to_dict(row: sqlite3.Row | None) -> Optional[Dict[str, Any]]:
@@ -717,9 +755,19 @@ def parse_rule_form(form, owner: Dict[str, Any], actor: Dict[str, Any], existing
     try:
         port = int(port_str)
     except ValueError as exc:
-        raise ValueError("端口必须是数字。") from exc
+        raise ValueError("目标端口必须是数字。") from exc
     if not (1 <= port <= 65535):
-        raise ValueError("端口范围必须是 1-65535。")
+        raise ValueError("目标端口范围必须是 1-65535。")
+
+    listen_port_raw = (form.get("listen_port") or "").strip()
+    if listen_port_raw == "":
+        listen_port = default_listen_port()
+    else:
+        try:
+            listen_port = int(listen_port_raw)
+        except ValueError as exc:
+            raise ValueError("入站端口必须是数字。") from exc
+    validate_listen_port(listen_port)
 
     if actor["role"] == "admin":
         speed = parse_float_or_none(form.get("speed_limit_mbps", ""), "限速")
@@ -731,7 +779,16 @@ def parse_rule_form(form, owner: Dict[str, Any], actor: Dict[str, Any], existing
         speed = none_if_zero(owner.get("rule_speed_limit_mbps"))
         traffic = none_if_zero(owner.get("rule_traffic_limit_gb"))
 
-    return {"sni": sni, "target": target, "port": port, "note": note, "enabled": enabled, "speed_limit_mbps": speed, "traffic_limit_gb": traffic}
+    return {
+        "sni": sni,
+        "target": target,
+        "port": port,
+        "listen_port": listen_port,
+        "note": note,
+        "enabled": enabled,
+        "speed_limit_mbps": speed,
+        "traffic_limit_gb": traffic,
+    }
 
 
 def cap_limit(value: Optional[float], cap: Any) -> Optional[float]:
@@ -756,16 +813,41 @@ def none_if_zero(value: Any) -> Optional[float]:
 def insert_rule(rule: Dict[str, Any]) -> None:
     execute(
         """INSERT INTO rules
-        (id, owner_id, sni, target, port, note, enabled, relay_port, speed_limit_mbps, traffic_limit_gb, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (rule["id"], rule["owner_id"], rule["sni"], rule["target"], rule["port"], rule["note"], rule["enabled"], rule["relay_port"], rule["speed_limit_mbps"], rule["traffic_limit_gb"], utc_now(), utc_now()),
+        (id, owner_id, sni, target, port, listen_port, note, enabled, relay_port, speed_limit_mbps, traffic_limit_gb, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            rule["id"],
+            rule["owner_id"],
+            rule["sni"],
+            rule["target"],
+            rule["port"],
+            int(rule.get("listen_port") or default_listen_port()),
+            rule["note"],
+            rule["enabled"],
+            rule["relay_port"],
+            rule["speed_limit_mbps"],
+            rule["traffic_limit_gb"],
+            utc_now(),
+            utc_now(),
+        ),
     )
 
 
 def update_rule_row(rule_id: str, rule: Dict[str, Any]) -> None:
     execute(
-        """UPDATE rules SET sni=?, target=?, port=?, note=?, enabled=?, speed_limit_mbps=?, traffic_limit_gb=?, updated_at=? WHERE id=?""",
-        (rule["sni"], rule["target"], rule["port"], rule["note"], rule["enabled"], rule["speed_limit_mbps"], rule["traffic_limit_gb"], utc_now(), rule_id),
+        """UPDATE rules SET sni=?, target=?, port=?, listen_port=?, note=?, enabled=?, speed_limit_mbps=?, traffic_limit_gb=?, updated_at=? WHERE id=?""",
+        (
+            rule["sni"],
+            rule["target"],
+            rule["port"],
+            int(rule.get("listen_port") or default_listen_port()),
+            rule["note"],
+            rule["enabled"],
+            rule["speed_limit_mbps"],
+            rule["traffic_limit_gb"],
+            utc_now(),
+            rule_id,
+        ),
     )
 
 
@@ -940,6 +1022,17 @@ def active_rules_for_config() -> List[Dict[str, Any]]:
     return active
 
 
+def group_rules_by_listen_port(rules: List[Dict[str, Any]], default_port: int) -> Dict[int, List[Dict[str, Any]]]:
+    groups: Dict[int, List[Dict[str, Any]]] = {default_port: []}
+    for rule in rules:
+        try:
+            port = int(rule.get("listen_port") or default_port)
+        except (TypeError, ValueError):
+            port = default_port
+        groups.setdefault(port, []).append(rule)
+    return groups
+
+
 def generate_gost_config() -> str:
     settings = load_settings()
     listen = settings.get("listen") or DEFAULT_LISTEN
@@ -948,48 +1041,97 @@ def generate_gost_config() -> str:
         raise RuntimeError(f"监听地址无效：{listen}")
     if not validate_backend_addr(fallback):
         raise RuntimeError(f"默认后端无效：{fallback}")
-    lines = [
-        "services:",
-        "- name: reality-443",
-        f'  addr: "{listen}"',
-        "  handler:",
-        "    type: tcp",
-        "    metadata:",
-        "      sniffing: true",
-        "  listener:",
-        "    type: tcp",
-        "  forwarder:",
-        "    nodes:",
-    ]
+    default_port = listen_port_of(listen) or 443
     mode = settings.get("forwarding_mode", "direct")
-    for rule in active_rules_for_config():
-        sni = str(rule["sni"]).lower()
-        if mode == "carpool":
-            relay_port = int(rule["relay_port"])
-            backend = f"{RELAY_HOST}:{relay_port}"
-        else:
-            backend = f"{rule['target']}:{int(rule['port'])}"
+    groups = group_rules_by_listen_port(active_rules_for_config(), default_port)
+
+    lines = ["services:"]
+    # Default port first, then the extra inbound ports in ascending order.
+    for port in sorted(groups, key=lambda p: (p != default_port, p)):
+        rules = groups[port]
+        is_default = port == default_port
+        addr = listen if is_default else f":{port}"
+        # A lone rule on a dedicated port is a plain TCP port forward; several
+        # rules sharing one port need SNI dispatch to tell them apart.
+        plain_forward = (not is_default) and len(rules) == 1
         lines.extend([
-            f"    - name: {sanitize_node_name(sni)}",
-            f"      addr: {backend}",
-            "      matcher:",
-            f"        rule: Host(`{sni}`)",
+            f"- name: reality-{port}",
+            f'  addr: "{addr}"',
+            "  handler:",
+            "    type: tcp",
         ])
-    lines.extend([
-        f"    - name: {sanitize_node_name('', fallback=True)}",
-        f"      addr: {fallback}",
-        "",
-    ])
+        if not plain_forward:
+            lines.extend(["    metadata:", "      sniffing: true"])
+        lines.extend(["  listener:", "    type: tcp", "  forwarder:", "    nodes:"])
+        for rule in rules:
+            sni = str(rule["sni"]).lower()
+            if mode == "carpool":
+                backend = f"{RELAY_HOST}:{int(rule['relay_port'])}"
+            else:
+                backend = f"{rule['target']}:{int(rule['port'])}"
+            lines.extend([f"    - name: {sanitize_node_name(sni)}", f"      addr: {backend}"])
+            if not plain_forward:
+                lines.extend(["      matcher:", f"        rule: Host(`{sni}`)"])
+        if is_default:
+            lines.extend([
+                f"    - name: {sanitize_node_name('', fallback=True)}",
+                f"      addr: {fallback}",
+            ])
+        lines.append("")
     return "\n".join(lines)
 
 
-def apply_config(restart: bool) -> None:
+_APPLY_LOCK = threading.Lock()
+_APPLY_TIMER: Optional[threading.Timer] = None
+APPLY_STATE: Dict[str, Any] = {"pending": False, "last_at": None, "error": None}
+
+
+def write_gost_config() -> str:
     yaml_text = generate_gost_config()
     atomic_write_text(GOST_CONFIG, yaml_text, mode=0o644)
-    if restart:
-        code, out = run_cmd(["systemctl", "restart", GOST_SERVICE], allow_fail=True)
+    return yaml_text
+
+
+def schedule_apply(delay: Optional[float] = None) -> None:
+    """Restart GOST *after* the HTTP response has been flushed.
+
+    The panel is itself reached through GOST (443 -> Caddy), so restarting the
+    service while the request is still in flight kills the browser connection and
+    the user sees a connection error instead of the redirect target. Debouncing
+    also collapses a burst of edits into a single restart.
+    """
+    global _APPLY_TIMER
+    delay = APPLY_DELAY if delay is None else delay
+    with _APPLY_LOCK:
+        if _APPLY_TIMER is not None:
+            _APPLY_TIMER.cancel()
+        timer = threading.Timer(max(float(delay), 0.5), _apply_worker)
+        timer.daemon = True
+        _APPLY_TIMER = timer
+        APPLY_STATE["pending"] = True
+        timer.start()
+
+
+def _apply_worker() -> None:
+    global _APPLY_TIMER
+    with _APPLY_LOCK:
+        _APPLY_TIMER = None
+        APPLY_STATE["pending"] = False
+    try:
+        code, out = run_cmd(["systemctl", "restart", "--no-block", GOST_SERVICE], allow_fail=True)
         if code != 0:
             raise RuntimeError(out.strip() or f"systemctl restart {GOST_SERVICE} failed")
+        sync_relay_service()
+        APPLY_STATE["error"] = None
+    except Exception as exc:  # background thread: record instead of raising
+        APPLY_STATE["error"] = str(exc)
+    APPLY_STATE["last_at"] = utc_now()
+
+
+def apply_config(restart: bool) -> None:
+    write_gost_config()
+    if restart:
+        schedule_apply()
 
 
 def sync_relay_service() -> None:
@@ -1019,7 +1161,9 @@ def collect_status() -> Dict[str, str]:
         code, out = run_cmd(["systemctl", "is-active", svc], allow_fail=True)
         status[svc] = out.strip() if out.strip() else ("active" if code == 0 else "unknown")
     status["gost_version"] = run_cmd(["/usr/local/bin/gost", "-V"], allow_fail=True)[1].strip()
-    status["listen_443"] = run_cmd(["bash", "-lc", "ss -tulnp | grep ':443' || true"], allow_fail=True)[1].strip()
+    listen_dump = run_cmd(["bash", "-lc", "ss -tulnp | grep -E 'gost|:443' || true"], allow_fail=True)[1].strip()
+    status["listen_ports"] = listen_dump
+    status["listen_443"] = listen_dump
     return status
 
 
@@ -1051,6 +1195,13 @@ def parse_init_rules(raw: str, owner_id: str) -> List[Dict[str, Any]]:
         if "=" not in item or ":" not in item:
             raise ValueError("INIT_RULES 格式应为 sni=target:port,sni2=target2:port")
         sni, backend = item.split("=", 1)
+        listen_port = None
+        if "@" in backend:
+            backend, listen_s = backend.rsplit("@", 1)
+            if not listen_s.strip().isdigit():
+                raise ValueError(f"初始化规则的入站端口无效：{item}")
+            listen_port = int(listen_s.strip())
+            validate_listen_port(listen_port)
         target, port_s = backend.rsplit(":", 1)
         port = int(port_s)
         sni = sni.strip().lower()
@@ -1063,6 +1214,7 @@ def parse_init_rules(raw: str, owner_id: str) -> List[Dict[str, Any]]:
             "sni": sni,
             "target": target,
             "port": port,
+            "listen_port": listen_port or default_listen_port(),
             "note": "初始化规则",
             "enabled": 1,
             "relay_port": allocate_relay_port(),
