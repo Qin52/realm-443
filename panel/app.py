@@ -17,6 +17,7 @@ import os
 import random
 import re
 import secrets
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -132,7 +133,15 @@ def create_app() -> Flask:
         users = list_users() if user["role"] == "admin" else []
         status = collect_status()
         settings = load_settings()
-        return render_template("dashboard.html", stats=stats, rules=rules, users=users, status=status, settings=settings)
+        return render_template(
+            "dashboard.html",
+            stats=stats,
+            rules=rules,
+            users=users,
+            status=status,
+            settings=settings,
+            apply_state=dict(APPLY_STATE),
+        )
 
     @app.post("/rules")
     @require_login
@@ -1118,14 +1127,43 @@ def _apply_worker() -> None:
         _APPLY_TIMER = None
         APPLY_STATE["pending"] = False
     try:
-        code, out = run_cmd(["systemctl", "restart", "--no-block", GOST_SERVICE], allow_fail=True)
-        if code != 0:
-            raise RuntimeError(out.strip() or f"systemctl restart {GOST_SERVICE} failed")
+        reload_gost_service()
         sync_relay_service()
         APPLY_STATE["error"] = None
     except Exception as exc:  # background thread: record instead of raising
         APPLY_STATE["error"] = str(exc)
     APPLY_STATE["last_at"] = utc_now()
+
+
+def reload_gost_service() -> None:
+    """Reload GOST in place so in-flight connections (including this panel) survive.
+
+    `systemctl restart` tears down every proxied connection, which is why a
+    submission made through the panel used to end in a browser connection
+    error instead of the redirect. GOST supports SIGHUP config reload while
+    keeping listeners and established sessions alive, so prefer that and only
+    fall back to a full restart when the process is not running.
+    """
+    code, out = run_cmd(["systemctl", "is-active", GOST_SERVICE], allow_fail=True)
+    if code != 0 or out.strip() != "active":
+        code, out = run_cmd(["systemctl", "restart", "--no-block", GOST_SERVICE], allow_fail=True)
+        if code != 0:
+            raise RuntimeError(out.strip() or f"systemctl restart {GOST_SERVICE} failed")
+        return
+    code, out = run_cmd(["systemctl", "reload", "--no-block", GOST_SERVICE], allow_fail=True)
+    if code == 0:
+        return
+    # Older unit files have no ExecReload; a direct SIGHUP still performs the
+    # same in-place reload without dropping established connections.
+    code, out = run_cmd(
+        ["systemctl", "kill", "--signal=SIGHUP", "--kill-whom=main", GOST_SERVICE],
+        allow_fail=True,
+    )
+    if code == 0:
+        return
+    code, out = run_cmd(["systemctl", "restart", "--no-block", GOST_SERVICE], allow_fail=True)
+    if code != 0:
+        raise RuntimeError(out.strip() or f"systemctl reload/restart {GOST_SERVICE} failed")
 
 
 def apply_config(restart: bool) -> None:
@@ -1136,8 +1174,10 @@ def apply_config(restart: bool) -> None:
 
 def sync_relay_service() -> None:
     if is_carpool_mode():
-        run_cmd(["systemctl", "enable", "--now", RELAY_SERVICE], allow_fail=True)
-        run_cmd(["systemctl", "restart", RELAY_SERVICE], allow_fail=True)
+        code, out = run_cmd(["systemctl", "is-active", RELAY_SERVICE], allow_fail=True)
+        if code != 0 or out.strip() != "active":
+            run_cmd(["systemctl", "enable", "--now", RELAY_SERVICE], allow_fail=True)
+            run_cmd(["systemctl", "restart", RELAY_SERVICE], allow_fail=True)
     else:
         run_cmd(["systemctl", "disable", "--now", RELAY_SERVICE], allow_fail=True)
 
@@ -1160,10 +1200,13 @@ def collect_status() -> Dict[str, str]:
     for svc in (GOST_SERVICE, RELAY_SERVICE, CADDY_SERVICE):
         code, out = run_cmd(["systemctl", "is-active", svc], allow_fail=True)
         status[svc] = out.strip() if out.strip() else ("active" if code == 0 else "unknown")
-    status["gost_version"] = run_cmd(["/usr/local/bin/gost", "-V"], allow_fail=True)[1].strip()
-    listen_dump = run_cmd(["bash", "-lc", "ss -tulnp | grep -E 'gost|:443' || true"], allow_fail=True)[1].strip()
+    gost_bin = shutil.which("gost") or "/usr/local/bin/gost"
+    if os.path.exists(gost_bin):
+        status["gost_version"] = run_cmd([gost_bin, "-V"], allow_fail=True)[1].strip()
+    else:
+        status["gost_version"] = ""
+    listen_dump = run_cmd(["bash", "-lc", "ss -tulnp 2>/dev/null | grep -E 'gost' || true"], allow_fail=True)[1].strip()
     status["listen_ports"] = listen_dump
-    status["listen_443"] = listen_dump
     return status
 
 

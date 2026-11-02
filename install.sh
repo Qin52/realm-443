@@ -357,6 +357,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/gost -C ${GOST_CONFIG}
+ExecReload=/bin/kill -SIGHUP \$MAINPID
 Restart=always
 RestartSec=3
 LimitNOFILE=1048576
