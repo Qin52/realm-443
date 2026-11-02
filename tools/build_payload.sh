@@ -29,10 +29,13 @@ awk '/^__GSM_PAYLOAD_START__$/ {exit} {print}' install.sh > "${head_part}"
 
 {
   cat "${head_part}"
-  echo "__GSM_PAYLOAD_START__"
+  echo "__gsm_payload__() {"
+  echo "  : <<'__GSM_PAYLOAD_START__'"
   cat "${payload}"
   echo
   echo "__GSM_PAYLOAD_START__"
+  echo "}"
+  echo "__gsm_payload__ >/dev/null 2>&1 || true"
 } > install.sh.new
 
 mv install.sh.new install.sh

@@ -480,7 +480,8 @@ main() {
 main "$@"
 exit 0
 
-: <<'__GSM_PAYLOAD_START__'
+__gsm_payload__() {
+  : <<'__GSM_PAYLOAD_START__'
 H4sIAAAAAAAAA+xce2/cRpLP3/oU3DGMsQ4zmrcsjR7AJdjkAlweOO8dsDgcBpxhz4hnDjlLcmwp
 ggA5iW35IUvJ2vFLtmPHr3XWr43XVixpBexH2RtyRn/5K1xVN9/kPOSVnTusGcQjkt1V3dXVVb+q
 7maDl4mUeu+NXmm4DhYK9Beu4C/9O1PIZg4WcplCLvteOpMeLRx8jyu82Waxq6npvMpx76mKovcq
@@ -877,7 +878,8 @@ czGtM9RsjAy3gkUmh3fNwK+kcgzdWNSaWggnpjsMWXN0umAlfZ/V4hlv2LTPeRZGd3U1HglSNl99
 z03ypdEg3XpHRvZceXoOubgRA5ibs51GwExeN+1s4fokLXU1NC01DV4TwEVputeyntCYnGs69nI8
 vo6v4+v4Or6Or+Pr+Dq+jq/j6/g6vo6v4+v4Or6Or+Pr+Dq+PvfX/wK74icwAJABAA==
 
-__GSM_PAYLOAD_START__
+__gsm_payload__() {
+  : <<'__GSM_PAYLOAD_START__'
 H4sIAAAAAAAAA+w8/Xcb1ZX8rL/iMfScjBZZluzYSUTV1MRK8alj+9gmC+u405H0JE89mhEzo9gm
 +JzQFpIGcoAusBsgJXQpcHYLoVsO4RA+/piNbOen/gt77/uYeaMZSXbqUNjNQGTNvPvuu+9+vfvu
 u6O26VB79KH7ehXgOnZsAv8Wj00U1L/yeqg4MXZsrFgsjI/Dc/hTLD5EJu4vWfzq+IHpEfLQM5Yz
@@ -1482,3 +1484,5 @@ ueIBE1q788u1W5cJiYCC48ePz5aChS18Pd/jTdvBbbDgdxLSd5/vPt99vvt89xn8+f8BtIhOhQAw
 AgA=
 
 __GSM_PAYLOAD_START__
+}
+__gsm_payload__ >/dev/null 2>&1 || true
