@@ -474,8 +474,12 @@ def listen_port_of(addr: str) -> Optional[int]:
     return port if 1 <= port <= 65535 else None
 
 
-def validate_listen_port(port: int) -> None:
-    """Reject inbound ports that would fight with the panel, Caddy or the relay range."""
+def validate_listen_port(port: int, actor: Optional[Dict[str, Any]] = None) -> None:
+    """Reject inbound ports that would fight with the panel, Caddy or the relay range.
+
+    A dedicated inbound port is also an extra public listener on the transit
+    server, so only the main account may open one (see `enforce_dedicated_port_policy`).
+    """
     if not (1 <= port <= 65535):
         raise ValueError("入站端口范围必须是 1-65535。")
     if port == PANEL_PORT:
@@ -484,6 +488,33 @@ def validate_listen_port(port: int) -> None:
         raise ValueError(f"入站端口 {port} 是 Caddy fallback 端口，请换一个。")
     if RELAY_PORT_MIN <= port <= RELAY_PORT_MAX:
         raise ValueError(f"入站端口不能落在本地中继保留段 {RELAY_PORT_MIN}-{RELAY_PORT_MAX} 内。")
+    # Anything below the default listen port is a well-known service port
+    # (80/443/8080-ish ranges used by mail, DNS, SSH, databases). Opening one
+    # of those on the transit VPS shadows a real service and widens the attack
+    # surface for no gain, because clients can always use the shared port.
+    default_port = default_listen_port()
+    if port < default_port and port != PANEL_PORT:
+        raise ValueError(
+            f"入站端口 {port} 低于默认监听端口 {default_port}，"
+            "属于系统/常见服务端口段，请改用默认端口或更高的端口。"
+        )
+
+
+def enforce_dedicated_port_policy(port: int, actor: Optional[Dict[str, Any]],
+                                  existing_rule: Optional[Dict[str, Any]] = None) -> None:
+    """Only the main account may open a dedicated inbound port.
+
+    A dedicated port is a second public listener on the transit host. Letting a
+    sub-account choose one hands it an arbitrary public port on somebody else's
+    server; the shared port plus SNI dispatch already serves every rule.
+    """
+    if port == default_listen_port():
+        return
+    if existing_rule and int(existing_rule.get("listen_port") or 0) == port:
+        return
+    if actor is None or actor.get("role") == "admin":
+        return
+    raise ValueError("只有主账号可以设置独立的入站端口，子账号请使用默认端口。")
 
 
 def port_owner(port: int) -> Optional[str]:
@@ -942,7 +973,8 @@ def parse_rule_form(form, owner: Dict[str, Any], actor: Dict[str, Any], existing
             listen_port = int(listen_port_raw)
         except ValueError as exc:
             raise ValueError("入站端口必须是数字。") from exc
-    validate_listen_port(listen_port)
+    validate_listen_port(listen_port, actor)
+    enforce_dedicated_port_policy(listen_port, actor, existing_rule)
     keep_port = None
     if existing_rule and existing_rule.get("listen_port"):
         keep_port = int(existing_rule["listen_port"])
@@ -1212,6 +1244,63 @@ def group_rules_by_listen_port(rules: List[Dict[str, Any]], default_port: int) -
     return groups
 
 
+def render_service_lines(port: int, rules: List[Dict[str, Any]], is_default: bool,
+                         listen: str, fallback: str, mode: str) -> List[str]:
+    """Render one GOST service, keyed on the inbound port.
+
+    Every service sniffs the ClientHello and matches on the SNI, including a
+    port that carries only a single rule. The old generator let a lone rule on
+    a dedicated port become a plain TCP forward (no sniffing, no matcher),
+    which sends *every* client that reaches the port to that rule's target:
+    any SNI, any unrelated TLS session, and any client that was never given the
+    SNI all came out of the landing server's exit, on any port the user typed
+    in. That is what turned the inbound port into a free exit channel.
+
+    Two properties keep the dispatch honest:
+
+    * every client node is matcher-gated on its own SNI;
+    * the forwarder uses strategy ``fifo``, because GOST's default round-robin
+      picks a node *before* the ClientHello is sniffed, so a client could be
+      sent to a node whose SNI does not match. FIFO walks the nodes in order
+      and takes the first one whose matcher passes.
+    """
+    addr = listen if is_default else f":{port}"
+    lines = [
+        f"- name: reality-{port}",
+        f'  addr: "{addr}"',
+        "  handler:",
+        "    type: tcp",
+        "    metadata:",
+        "      sniffing: true",
+        "  listener:",
+        "    type: tcp",
+        "  forwarder:",
+        "    nodes:",
+    ]
+    for rule in rules:
+        sni = str(rule["sni"]).lower()
+        if mode == "carpool":
+            backend = f"{RELAY_HOST}:{int(rule['relay_port'])}"
+        else:
+            backend = f"{rule['target']}:{int(rule['port'])}"
+        lines.extend([
+            f"    - name: {sanitize_node_name(sni)}",
+            f"      addr: {backend}",
+            "      matcher:",
+            f"        rule: Host(`{sni}`)",
+        ])
+    # The fallback is the only catch-all and it exists on the default port
+    # only. A dedicated inbound port has no catch-all, so a client whose SNI
+    # does not match is closed instead of being handed to some landing target.
+    if is_default:
+        lines.extend([
+            f"    - name: {sanitize_node_name('', fallback=True)}",
+            f"      addr: {fallback}",
+        ])
+    lines.extend(["  selector:", "    strategy: fifo"])
+    return lines
+
+
 def generate_gost_config() -> str:
     settings = load_settings()
     listen = settings.get("listen") or DEFAULT_LISTEN
@@ -1227,35 +1316,8 @@ def generate_gost_config() -> str:
     lines = ["services:"]
     # Default port first, then the extra inbound ports in ascending order.
     for port in sorted(groups, key=lambda p: (p != default_port, p)):
-        rules = groups[port]
         is_default = port == default_port
-        addr = listen if is_default else f":{port}"
-        # A lone rule on a dedicated port is a plain TCP port forward; several
-        # rules sharing one port need SNI dispatch to tell them apart.
-        plain_forward = (not is_default) and len(rules) == 1
-        lines.extend([
-            f"- name: reality-{port}",
-            f'  addr: "{addr}"',
-            "  handler:",
-            "    type: tcp",
-        ])
-        if not plain_forward:
-            lines.extend(["    metadata:", "      sniffing: true"])
-        lines.extend(["  listener:", "    type: tcp", "  forwarder:", "    nodes:"])
-        for rule in rules:
-            sni = str(rule["sni"]).lower()
-            if mode == "carpool":
-                backend = f"{RELAY_HOST}:{int(rule['relay_port'])}"
-            else:
-                backend = f"{rule['target']}:{int(rule['port'])}"
-            lines.extend([f"    - name: {sanitize_node_name(sni)}", f"      addr: {backend}"])
-            if not plain_forward:
-                lines.extend(["      matcher:", f"        rule: Host(`{sni}`)"])
-        if is_default:
-            lines.extend([
-                f"    - name: {sanitize_node_name('', fallback=True)}",
-                f"      addr: {fallback}",
-            ])
+        lines.extend(render_service_lines(port, groups[port], is_default, listen, fallback, mode))
         lines.append("")
     return "\n".join(lines)
 
@@ -1272,6 +1334,57 @@ def write_gost_config() -> str:
     validate_gost_config(yaml_text)
     atomic_write_text(GOST_CONFIG, yaml_text, mode=0o644)
     return yaml_text
+
+
+def validate_sni_gating(lines: List[str], service_names: List[str]) -> None:
+    """Refuse any config where a client-bearing node is not SNI-gated.
+
+    This is the regression guard for the open-relay bug: a node without a
+    `matcher` accepts every client that reaches the port, so the inbound port
+    turns into a free exit through the landing server. The only node allowed
+    to be matchless is the last one of a service, and only when it is the
+    configured Caddy fallback (that node must stay catch-all by design).
+    """
+    services: List[List[str]] = []
+    current: Optional[List[str]] = None
+    for line in lines:
+        if line.startswith("- name: "):
+            current = []
+            services.append(current)
+        elif current is not None:
+            current.append(line)
+    if len(services) != len(service_names):
+        raise RuntimeError("生成的 GOST 配置无效：服务段解析失败。")
+    for svc_index, block in enumerate(services):
+        # Lines are grouped *after* the "- name:" line, so the service name
+        # has to be tracked separately instead of read from the block.
+        name = service_names[svc_index].strip()
+        if "      sniffing: true" not in block:
+            raise RuntimeError(f"生成的 GOST 配置无效：服务 {name} 没有开启 SNI 嗅探。")
+        if "    strategy: fifo" not in block:
+            raise RuntimeError(f"生成的 GOST 配置无效：服务 {name} 没有配置 fifo 选择策略。")
+        # Walk the node list; group every node by its position so a matchless
+        # node can be checked against the fallback rule.
+        node_starts = [i for i, l in enumerate(block) if l.startswith("    - name:")]
+        # The node list ends where the first sibling key of the service
+        # (selector / chain) starts again at the 2-space indent level.
+        list_end = len(block)
+        for i in range(node_starts[-1] + 1 if node_starts else 0, len(block)):
+            if block[i].startswith("  ") and not block[i].startswith("   "):
+                list_end = i
+                break
+        for idx, start in enumerate(node_starts):
+            end = node_starts[idx + 1] if idx + 1 < len(node_starts) else list_end
+            node = block[start:end]
+            if any(l.strip() == "matcher:" for l in node):
+                continue
+            is_last = idx == len(node_starts) - 1
+            is_fallback = any(l.strip() == "- name: caddy-fallback" for l in node)
+            if not (is_last and is_fallback):
+                raise RuntimeError(
+                    f"生成的 GOST 配置无效：服务 {name} 的节点 {node[0].strip()} 没有 SNI 匹配规则，"
+                    "会把任意客户端转发到落地，等于开放出口。"
+                )
 
 
 def validate_gost_config(yaml_text: str) -> None:
@@ -1291,6 +1404,7 @@ def validate_gost_config(yaml_text: str) -> None:
     for required, label in (("  addr: ", "监听地址"), ("  handler:", "handler"), ("  forwarder:", "forwarder")):
         if sum(1 for l in lines if l.startswith(required)) < len(service_names):
             raise RuntimeError(f"生成的 GOST 配置无效：有服务缺少{label}。")
+    validate_sni_gating(lines, service_names)
 
 
 def schedule_apply(delay: Optional[float] = None) -> None:
@@ -1479,7 +1593,8 @@ def parse_init_rules(raw: str, owner_id: str) -> List[Dict[str, Any]]:
             if not listen_s.strip().isdigit():
                 raise ValueError(f"初始化规则的入站端口无效：{item}")
             listen_port = int(listen_s.strip())
-            validate_listen_port(listen_port)
+            # INIT_RULES runs from the installer as the main account.
+            validate_listen_port(listen_port, {"role": "admin"})
         target, port_s = backend.rsplit(":", 1)
         port = int(port_s)
         sni = sni.strip().lower()

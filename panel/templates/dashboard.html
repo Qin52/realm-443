@@ -139,7 +139,7 @@
       <div>
         <span class="kicker">新增转发</span>
         <h2 class="card-title">添加规则</h2>
-        <p class="card-hint">入站端口留空则使用默认监听端口。单独占用一个入站端口时，GOST 会把该端口的全部 TCP 流量转发到目标端口。</p>
+        <p class="card-hint">入站端口留空则使用默认监听端口。单独占用一个入站端口时，该端口同样按 SNI 分流：只有 SNI 匹配的客户端才会被转发，其他连接会被直接关闭。</p>
       </div>
     </div>
     <form method="post" action="{{ url_for('add_rule') }}" class="form-grid">
@@ -167,8 +167,14 @@
       <div class="form-row">
         <label class="field">
           <span>入站端口</span>
+          {% if is_admin %}
           <input name="listen_port" type="number" min="1" max="65535" value="{{ default_port }}" placeholder="留空使用默认端口">
-          <span class="sub">客户端连接的端口，可与默认端口不同。</span>
+          <span class="sub">建议保持默认端口 {{ default_port }}，多条规则靠 SNI 分流即可。只有主账号可以另开端口，且该端口仍会校验 SNI。</span>
+          {% else %}
+          <input value="{{ default_port }}" disabled>
+          <input type="hidden" name="listen_port" value="{{ default_port }}">
+          <span class="sub">子账号固定使用默认端口 {{ default_port }}，由 SNI 区分线路。</span>
+          {% endif %}
         </label>
         <label class="field">
           <span>目标端口</span>
@@ -332,7 +338,11 @@
                   <input type="hidden" name="enabled" value="{{ 'true' if rule.enabled else 'false' }}">
                   <div class="form-row">
                     <label class="field"><span>SNI</span><input name="sni" value="{{ rule.sni }}" required></label>
+                    {% if is_admin %}
                     <label class="field"><span>入站端口</span><input name="listen_port" value="{{ rule.listen_port }}" required type="number" min="1" max="65535"></label>
+                    {% else %}
+                    <label class="field"><span>入站端口</span><input value="{{ rule.listen_port }}" disabled><input type="hidden" name="listen_port" value="{{ rule.listen_port }}"></label>
+                    {% endif %}
                   </div>
                   <div class="form-row">
                     <label class="field"><span>目标</span><input name="target" value="{{ rule.target }}" required></label>

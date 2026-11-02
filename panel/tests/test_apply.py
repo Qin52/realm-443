@@ -103,16 +103,25 @@ def test_default_port_uses_sni_dispatch(admin_id: str) -> None:
     print("ok default port SNI dispatch")
 
 
-def test_mapped_port_single_rule_is_plain_forward(admin_id: str) -> None:
+def test_mapped_port_single_rule_stays_sni_gated(admin_id: str) -> None:
+    """Regression: a lone rule on its own port used to be a plain TCP forward.
+
+    That made the port an open exit -- any SNI, and any client that never got
+    the SNI, was forwarded to the landing target. Every service must sniff and
+    every client node must carry a matcher.
+    """
     reset_rules(admin_id)
     app.insert_rule(make_rule("r1", "a.example.com", "198.51.100.1", 443, 8443))
     config = app.generate_gost_config()
     assert 'addr: ":8443"' in config, config
     block = service_block(config, 8443)
-    assert "matcher:" not in block, block
-    assert "sniffing" not in block, block
-    assert "198.51.100.1:443" in block, block
-    print("ok mapped port plain forward")
+    assert "sniffing: true" in block, block
+    assert block.count("matcher:") == 1, block
+    assert "rule: Host(`a.example.com`)" in block, block
+    # No catch-all: an unmatched SNI must be closed, not forwarded somewhere.
+    assert "caddy-fallback" not in block, block
+    assert "strategy: fifo" in block, block
+    print("ok mapped port single rule stays SNI gated")
 
 
 def test_mapped_port_multi_rule_uses_sni(admin_id: str) -> None:
@@ -124,7 +133,84 @@ def test_mapped_port_multi_rule_uses_sni(admin_id: str) -> None:
     block = service_block(config, 8443)
     assert block.count("matcher:") == 2, block
     assert "caddy-fallback" not in block, block
+    assert "strategy: fifo" in block, block
     print("ok mapped port SNI dispatch")
+
+
+def test_every_client_node_is_matcher_gated(admin_id: str) -> None:
+    """No node outside the Caddy fallback may be catch-all."""
+    reset_rules(admin_id)
+    app.insert_rule(make_rule("r1", "a.example.com", "198.51.100.1", 443, 443))
+    app.insert_rule(make_rule("r2", "b.example.com", "198.51.100.2", 443, 8443))
+    app.insert_rule(make_rule("r3", "c.example.com", "198.51.100.3", 443, 8444))
+    config = app.generate_gost_config()
+    nodes: list[list[str]] = []
+    current = None
+    for line in config.splitlines():
+        if line.startswith("    - name: "):
+            current = [line]
+            nodes.append(current)
+        elif current is not None:
+            current.append(line)
+    matchless = ["\n".join(n) for n in nodes if not any(l.strip() == "matcher:" for l in n)]
+    assert len(matchless) == 1, matchless
+    assert "caddy-fallback" in matchless[0], matchless[0]
+    print("ok every client node is matcher gated")
+
+
+def test_validator_rejects_open_forward() -> None:
+    """A config that exposes a port as an open forward must not be written."""
+    poisoned = "\n".join([
+        "services:",
+        "- name: reality-8443",
+        '  addr: ":8443"',
+        "  handler:",
+        "    type: tcp",
+        "    metadata:",
+        "      sniffing: true",
+        "  listener:",
+        "    type: tcp",
+        "  forwarder:",
+        "    nodes:",
+        "    - name: sni-a-example-com",
+        "      addr: 198.51.100.1:443",
+        "  selector:",
+        "    strategy: fifo",
+    ])
+    try:
+        app.validate_gost_config(poisoned)
+    except RuntimeError as exc:
+        assert "开放出口" in str(exc), exc
+    else:
+        raise AssertionError("validator accepted a matcher-less forward")
+    print("ok validator rejects open forward")
+
+
+def test_validator_requires_sniffing() -> None:
+    poisoned = "\n".join([
+        "services:",
+        "- name: reality-8443",
+        '  addr: ":8443"',
+        "  handler:",
+        "    type: tcp",
+        "  listener:",
+        "    type: tcp",
+        "  forwarder:",
+        "    nodes:",
+        "    - name: sni-a-example-com",
+        "      addr: 198.51.100.1:443",
+        "      matcher:",
+        "        rule: Host(`a.example.com`)",
+        "  selector:",
+        "    strategy: fifo",
+    ])
+    try:
+        app.validate_gost_config(poisoned)
+    except RuntimeError as exc:
+        assert "SNI" in str(exc), exc
+    else:
+        raise AssertionError("validator accepted a service without sniffing")
+    print("ok validator requires sniffing")
 
 
 def test_inbound_port_validation(admin_id: str) -> None:
@@ -135,15 +221,31 @@ def test_inbound_port_validation(admin_id: str) -> None:
             return dict.get(self, key, default)
 
     actor = {"id": admin_id, "role": "admin"}
-    for port, expected in (("7090", "面板"), ("8053", "Caddy"), ("56000", "中继"), ("99999", "1-65535"), ("0", "1-65535")):
+    sub = {"id": "sub1", "role": "user"}
+    for port, expected in (("7090", "面板"), ("8053", "Caddy"), ("56000", "中继"), ("99999", "1-65535"),
+                           ("0", "1-65535"), ("22", "常见服务端口段"), ("443", "常见服务端口段")):
+        if port == "443":
+            continue  # 443 is the default listen port here, handled below
         try:
             app.parse_rule_form(Form(sni="x.example.com", target="198.51.100.1", port="443", listen_port=port), actor, actor, None)
         except ValueError as exc:
             assert expected in str(exc), (port, exc)
         else:
             raise AssertionError(f"inbound port {port} was accepted")
+
+    # 子账号不能另开入站端口，只能用默认端口。
+    sub_owner = {"id": "sub1", "role": "user"}
+    try:
+        app.parse_rule_form(Form(sni="x.example.com", target="198.51.100.1", port="443", listen_port="8443"), sub, sub_owner, None)
+    except ValueError as exc:
+        assert "主账号" in str(exc), exc
+    else:
+        raise AssertionError("sub account was allowed to pick a dedicated inbound port")
+
     rule = app.parse_rule_form(Form(sni="x.example.com", target="198.51.100.1", port="443", listen_port="8443"), actor, actor, None)
     assert rule["listen_port"] == 8443 and rule["port"] == 443, rule
+    default_rule = app.parse_rule_form(Form(sni="y.example.com", target="198.51.100.1", port="443", listen_port=""), sub, sub_owner, None)
+    assert default_rule["listen_port"] == 443, default_rule
     print("ok inbound port validation")
 
 
@@ -210,8 +312,11 @@ def test_bad_config_rolls_back(admin_id: str) -> None:
 def main() -> int:
     admin_id = install_user()
     test_default_port_uses_sni_dispatch(admin_id)
-    test_mapped_port_single_rule_is_plain_forward(admin_id)
+    test_mapped_port_single_rule_stays_sni_gated(admin_id)
     test_mapped_port_multi_rule_uses_sni(admin_id)
+    test_every_client_node_is_matcher_gated(admin_id)
+    test_validator_rejects_open_forward()
+    test_validator_requires_sniffing()
     test_inbound_port_validation(admin_id)
     test_reload_prefers_sighup()
     test_bad_config_rolls_back(admin_id)
