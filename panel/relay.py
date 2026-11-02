@@ -13,6 +13,7 @@ import signal
 import socket
 import sqlite3
 import time
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -82,6 +83,7 @@ class RelayManager:
 
     def db(self) -> sqlite3.Connection:
         conn = sqlite3.connect(DB_FILE)
+        conn.execute("PRAGMA busy_timeout=5000")
         conn.row_factory = sqlite3.Row
         return conn
 
@@ -121,7 +123,7 @@ class RelayManager:
     def load_rules(self) -> Dict[str, Rule]:
         if not DB_FILE.exists():
             return {}
-        with self.db() as db:
+        with closing(self.db()) as db:
             rows = db.execute(
                 """SELECT r.*, u.enabled owner_enabled, u.expires_at owner_expires_at,
                 u.account_traffic_limit_gb FROM rules r JOIN users u ON u.id=r.owner_id WHERE r.enabled=1"""
@@ -134,7 +136,7 @@ class RelayManager:
         return rules
 
     def owner_used_bytes(self, owner_id: str) -> int:
-        with self.db() as db:
+        with closing(self.db()) as db:
             row = db.execute("SELECT COALESCE(SUM(bytes_up + bytes_down),0) used FROM rules WHERE owner_id=?", (owner_id,)).fetchone()
         used = int(row["used"] or 0)
         # Add pending bytes for all rules owned by this account.
@@ -200,7 +202,7 @@ class RelayManager:
             self.pending.clear()
         if not items:
             return
-        with self.db() as db:
+        with closing(self.db()) as db, db:
             for rid, (up, down) in items:
                 db.execute("UPDATE rules SET bytes_up=bytes_up+?, bytes_down=bytes_down+?, updated_at=? WHERE id=?", (up, down, datetime.now(timezone.utc).replace(microsecond=0).isoformat(), rid))
             db.commit()
@@ -218,6 +220,7 @@ class RelayManager:
                 writer.close()
                 await writer.wait_closed()
                 return
+            target_writer: Optional[asyncio.StreamWriter] = None
             try:
                 target_reader, target_writer = await asyncio.open_connection(rule.target, rule.port, family=socket.AF_UNSPEC)
                 log.info("connect rule=%s sni=%s peer=%s target=%s:%s", rule.id, rule.sni, peer, rule.target, rule.port)
@@ -234,11 +237,12 @@ class RelayManager:
                     await writer.wait_closed()
                 except Exception:
                     pass
-                try:
-                    target_writer.close()  # type: ignore[name-defined]
-                    await target_writer.wait_closed()  # type: ignore[name-defined]
-                except Exception:
-                    pass
+                if target_writer is not None:
+                    try:
+                        target_writer.close()
+                        await target_writer.wait_closed()
+                    except Exception:
+                        pass
                 await self.flush_stats()
 
         server = await asyncio.start_server(handler, RELAY_HOST, rule.relay_port)
@@ -255,10 +259,13 @@ class RelayManager:
             data = await reader.read(BUFFER_SIZE)
             if not data:
                 break
+            # Count the bytes we just read before any quota/reload decision can
+            # break the loop: otherwise the transfer that trips the quota is
+            # dropped from usage accounting and the limit under-reports.
+            await self.add_pending(rule.id, direction, len(data))
             await limiter.wait(len(data))
             writer.write(data)
             await writer.drain()
-            await self.add_pending(rule.id, direction, len(data))
         try:
             writer.close()
         except Exception:

@@ -25,6 +25,7 @@ import tempfile
 import threading
 import time
 import uuid
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -380,13 +381,15 @@ def ensure_dirs() -> None:
 def get_db() -> sqlite3.Connection:
     ensure_dirs()
     conn = sqlite3.connect(DB_FILE)
+    # Wait instead of failing when the relay is writing counters at the same time.
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
 
 def init_db() -> None:
-    with get_db() as db:
+    with closing(get_db()) as db, db:
         db.executescript(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -475,36 +478,57 @@ def validate_listen_port(port: int) -> None:
         raise ValueError(f"入站端口不能落在本地中继保留段 {RELAY_PORT_MIN}-{RELAY_PORT_MAX} 内。")
 
 
-def port_in_use(port: int) -> bool:
-    """True when any TCP listener already holds the port.
+def port_owner(port: int) -> Optional[str]:
+    """Process name holding `port`, "" when free, None when unknown.
 
     Checking with `ss` rather than a probe bind avoids briefly occupying the
-    port and avoids reporting a false negative on servers where SO_REUSEADDR
-    lets a second bind succeed.
+    port and avoids a false negative on servers where SO_REUSEADDR lets a
+    second bind succeed.
     """
-    if shutil.which("ss"):
-        code, out = run_cmd(["ss", "-ltnH", f"sport = :{port}"], allow_fail=True)
-        if code == 0:
-            return any(line.split()[0].startswith("LISTEN") for line in out.splitlines() if line.strip())
-    code, out = run_cmd(["bash", "-lc", f"ss -ltn 2>/dev/null | grep -E ':{port}\\b' || true"], allow_fail=True)
-    if code == 0 and out.strip():
+    code, out = run_cmd(["ss", "-ltnpH", f"sport = :{port}"], allow_fail=True)
+    if code != 0:
+        return None
+    lines = [l for l in out.splitlines() if l.strip().startswith("LISTEN")]
+    if not lines:
+        return ""
+    match = re.search(r'users:\(\("([^"]+)"', out)
+    return match.group(1) if match else ""
+
+
+def port_in_use(port: int, exclude: Tuple[str, ...] = ()) -> bool:
+    """True when a program other than `exclude` holds the port."""
+    owner = port_owner(port)
+    if owner is None:
+        # `ss` unavailable: fall back to a plain listen check rather than
+        # silently letting a conflicting port through.
+        code, out = run_cmd(["bash", "-lc", f"ss -ltn 2>/dev/null | grep -E ':{port}\\b' || true"], allow_fail=True)
+        return code == 0 and bool(out.strip())
+    if owner == "":
+        # Listener exists but its process is not readable (non-root panel).
+        return port_reserved_by_panel(port)
+    return owner not in exclude
+
+
+def port_reserved_by_panel(port: int) -> bool:
+    """A listener without a readable owner still counts when the panel claims it."""
+    if port == default_listen_port():
         return True
-    return False
+    return any(int(r.get("listen_port") or 0) == port for r in query_all("SELECT listen_port FROM rules"))
 
 
 def validate_listen_port_available(port: int, keep: Optional[int] = None) -> None:
-    """Reject a new inbound port that another process already occupies.
+    """Reject a new inbound port that another program already occupies.
 
-    GOST binds these ports itself, so a port held by anything else (another
-    GOST listener, a service, a stray process) can never serve the rule.
+    GOST binds these ports itself, so a port held by anything else (a service,
+    a stray process) can never serve the rule. Ports the panel already manages
+    are fine: GOST (or the relay) owns them and reloads in place, and the
+    `keep` port is the one this rule currently uses.
     """
     if keep is not None and port == keep:
         return
-    if not port_in_use(port):
-        return
     if port == default_listen_port():
         return
-    if any(int(r.get("listen_port") or 0) == port for r in query_all("SELECT listen_port FROM rules")):
+    if not port_in_use(port, exclude=(os.path.basename(shutil.which("gost") or "gost"),)):
         return
     raise ValueError(f"入站端口 {port} 已被其他程序占用，请换一个。")
 
@@ -514,23 +538,23 @@ def row_to_dict(row: sqlite3.Row | None) -> Optional[Dict[str, Any]]:
 
 
 def query_one(sql: str, params: Tuple[Any, ...] = ()) -> Optional[Dict[str, Any]]:
-    with get_db() as db:
+    with closing(get_db()) as db:
         return row_to_dict(db.execute(sql, params).fetchone())
 
 
 def query_all(sql: str, params: Tuple[Any, ...] = ()) -> List[Dict[str, Any]]:
-    with get_db() as db:
+    with closing(get_db()) as db:
         return [dict(r) for r in db.execute(sql, params).fetchall()]
 
 
 def execute(sql: str, params: Tuple[Any, ...] = ()) -> None:
-    with get_db() as db:
+    with closing(get_db()) as db, db:
         db.execute(sql, params)
         db.commit()
 
 
 def executemany(sql: str, params: Iterable[Tuple[Any, ...]]) -> None:
-    with get_db() as db:
+    with closing(get_db()) as db, db:
         db.executemany(sql, params)
         db.commit()
 

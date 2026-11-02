@@ -144,7 +144,7 @@ SQLite 数据库：初始很小，随规则和流量统计增长
 在中转 VPS 上执行：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/ddminxx/gost-sni-manager/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/Qin52/realm-443/master/install.sh)
 ```
 
 脚本会自动安装轻量依赖、GOST v3、Caddy 和面板，并询问：
@@ -256,7 +256,7 @@ REALITY 连接端口：443
 在 VPS A 执行：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/ddminxx/gost-sni-manager/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/Qin52/realm-443/master/install.sh)
 ```
 
 安装完成后登录面板。默认是“自用模式”。
@@ -502,7 +502,7 @@ apt update
 ## 卸载
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/ddminxx/gost-sni-manager/main/uninstall.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/Qin52/realm-443/master/uninstall.sh)
 ```
 
 卸载脚本会删除面板、数据库、GOST 配置和 systemd 服务，并询问是否删除 GOST 二进制和 Caddy 软件包。
