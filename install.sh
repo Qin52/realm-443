@@ -384,6 +384,7 @@ https://${PANEL_DOMAIN} {
 }
 
 :${CADDY_HTTPS_PORT} {
+    bind 127.0.0.1
     tls internal
     respond "GOST fallback OK" 200
 }
@@ -397,6 +398,7 @@ EOF2
 }
 
 :${CADDY_HTTPS_PORT} {
+    bind 127.0.0.1
     tls internal
     respond "GOST fallback OK" 200
 }
