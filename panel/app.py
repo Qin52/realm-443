@@ -28,6 +28,7 @@ import uuid
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
+import ssl
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from flask import (
@@ -60,6 +61,7 @@ PANEL_PORT = int(os.environ.get("PANEL_PORT", os.environ.get("GOST_PANEL_PORT", 
 CADDY_HTTPS_PORT = int(os.environ.get("CADDY_HTTPS_PORT", "8053"))
 APPLY_DELAY = float(os.environ.get("GOST_APPLY_DELAY", "2.5"))
 PANEL_DOMAIN = os.environ.get("PANEL_DOMAIN", "").strip().lower()
+CERT_DIR = Path(os.environ.get("GOST_CERT_DIR", "/root/cert"))
 
 DOMAIN_RE = re.compile(r"^(?=.{1,253}$)([A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$")
 HOST_RE = re.compile(r"^[A-Za-z0-9.-]+$|^\[[0-9A-Fa-f:.]+\]$")
@@ -91,6 +93,7 @@ def create_app() -> Flask:
             "fmt_dt": fmt_dt,
             "fmt_limit": fmt_limit,
             "account_usage": account_usage if user else None,
+            "cert_status": cert_status,
         }
 
     @app.get("/login")
@@ -134,6 +137,9 @@ def create_app() -> Flask:
         users = list_users() if user["role"] == "admin" else []
         status = collect_status()
         settings = load_settings()
+        for rule in rules:
+            rule["cert"] = cert_status(rule["sni"])
+        panel_cert = cert_status(settings.get("panel_domain", ""))
         return render_template(
             "dashboard.html",
             stats=stats,
@@ -143,6 +149,8 @@ def create_app() -> Flask:
             settings=settings,
             apply_state=dict(APPLY_STATE),
             default_port=default_listen_port(),
+            panel_cert=panel_cert,
+            cert_dir=str(CERT_DIR),
         )
 
     @app.post("/rules")
@@ -598,6 +606,105 @@ def parse_dt(value: str | None) -> Optional[datetime]:
         return dt.astimezone(timezone.utc)
     except ValueError:
         return None
+
+
+_cert_cache: Dict[str, Dict[str, Any]] = {}
+_cert_cache_lock = threading.Lock()
+_CERT_CACHE_TTL = 300.0
+
+
+def cert_status(domain: str) -> Dict[str, Any]:
+    """Look for a certificate matching `domain` under CERT_DIR.
+
+    Accepts `<domain>.cer`, `<domain>.crt`, `<domain>.pem`, or the generic
+    `fullchain.cer`. Returns a dict with keys: exists (bool), path (str|None),
+    not_after (datetime|None), issuer (str|None), days_left (int|None),
+    state ("ok"|"expiring"|"expired"|"none"|"error").
+    Result is cached for 5 minutes so dashboard loads stay cheap.
+    """
+    domain = (domain or "").strip().lower()
+    if not domain:
+        return {"exists": False, "path": None, "not_after": None, "issuer": None, "days_left": None, "state": "none"}
+    now = time.time()
+    with _cert_cache_lock:
+        cached = _cert_cache.get(domain)
+        if cached and now - cached["_ts"] < _CERT_CACHE_TTL:
+            return {k: v for k, v in cached.items() if k != "_ts"}
+    result = _cert_status_uncached(domain)
+    result["_ts"] = now
+    with _cert_cache_lock:
+        _cert_cache[domain] = result
+    return {k: v for k, v in result.items() if k != "_ts"}
+
+
+def _cert_status_uncached(domain: str) -> Dict[str, Any]:
+    base = {"exists": False, "path": None, "not_after": None, "issuer": None, "days_left": None, "state": "none"}
+    if not CERT_DIR.is_dir():
+        return base
+    candidates = [
+        CERT_DIR / f"{domain}.cer",
+        CERT_DIR / f"{domain}.crt",
+        CERT_DIR / f"{domain}.pem",
+        CERT_DIR / "fullchain.cer",
+        CERT_DIR / "fullchain.pem",
+    ]
+    cert_path = next((c for c in candidates if c.is_file()), None)
+    if cert_path is None:
+        # Also match the x-ui convention: <dir>/<domain>/fullchain.cer
+        nested = CERT_DIR / domain / "fullchain.cer"
+        if nested.is_file():
+            cert_path = nested
+    if cert_path is None:
+        return base
+    try:
+        cert = ssl._ssl._test_decode_cert(str(cert_path))
+    except Exception:
+        return {**base, "exists": True, "path": str(cert_path), "state": "error"}
+    # Domain-specific files are trusted by filename; generic names (fullchain.*)
+    # must actually cover the requested domain via CN or SAN.
+    if cert_path.name in ("fullchain.cer", "fullchain.pem"):
+        subject_names = set()
+        for group in cert.get("subject", []):
+            for pair in group:
+                if pair[0] in ("commonName",):
+                    subject_names.add(pair[1].lower())
+        for san_group in cert.get("subjectAltName", []):
+            if isinstance(san_group, tuple) and len(san_group) == 2:
+                subject_names.add(str(san_group[1]).lower())
+        if domain not in subject_names:
+            return base
+    not_after_raw = cert.get("notAfter")
+    not_after: Optional[datetime] = None
+    if not_after_raw:
+        for fmt in ("%b %d %H:%M:%S %Y %Z", "%b %d %H:%M:%S %Y GMT"):
+            try:
+                not_after = datetime.strptime(not_after_raw, fmt).replace(tzinfo=timezone.utc)
+                break
+            except ValueError:
+                continue
+    issuer_parts = cert.get("issuer", [])
+    issuer = ""
+    for group in issuer_parts:
+        for pair in group:
+            if pair[0] == "organizationName":
+                issuer = pair[1]
+    days_left = None
+    state = "ok"
+    if not_after:
+        delta = (not_after - datetime.now(timezone.utc)).days
+        days_left = delta
+        if delta < 0:
+            state = "expired"
+        elif delta <= 14:
+            state = "expiring"
+    return {
+        "exists": True,
+        "path": str(cert_path),
+        "not_after": not_after,
+        "issuer": issuer or None,
+        "days_left": days_left,
+        "state": state,
+    }
 
 
 def fmt_dt(value: str | None) -> str:

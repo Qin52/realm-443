@@ -295,7 +295,25 @@
               {% if carpool %}<small>中继 127.0.0.1:{{ rule.relay_port }}</small>{% else %}<small>GOST 直连</small>{% endif %}
             </div>
           </td>
-          <td data-label="SNI"><span class="mono">{{ rule.sni }}</span></td>
+          <td data-label="SNI">
+            <div class="cell-stack">
+              <span class="mono">{{ rule.sni }}</span>
+              {% set c = rule.cert %}
+              {% if c and c.exists %}
+                {% if c.state == 'ok' %}
+                  <small><span class="pill ok" title="证书有效期至 {{ fmt_dt(c.not_after.isoformat()) }} · {{ c.issuer or '未知签发者' }}">证书 {{ c.days_left }} 天</span></small>
+                {% elif c.state == 'expiring' %}
+                  <small><span class="pill warn" title="证书即将到期：{{ fmt_dt(c.not_after.isoformat()) }}">证书 {{ c.days_left }} 天</span></small>
+                {% elif c.state == 'expired' %}
+                  <small><span class="pill bad" title="证书已过期：{{ fmt_dt(c.not_after.isoformat()) }}">已过期</span></small>
+                {% else %}
+                  <small><span class="pill warn">证书异常</span></small>
+                {% endif %}
+              {% else %}
+                <small><span class="pill" title="未在 {{ cert_dir }} 下找到匹配证书">无证书</span></small>
+              {% endif %}
+            </div>
+          </td>
           <td data-label="目标"><span class="mono">{{ rule.target }}:{{ rule.port }}</span></td>
           {% if carpool %}
           <td data-label="限速">{{ fmt_limit(rule.speed_limit_mbps, 'Mbps') }}</td>
