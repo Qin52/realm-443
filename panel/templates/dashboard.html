@@ -167,7 +167,7 @@
       <div class="form-row">
         <label class="field">
           <span>入站端口</span>
-          <input name="listen_port" type="number" min="1" max="65535" value="{{ settings.listen.rsplit(':', 1)[-1] }}" placeholder="留空使用默认端口">
+          <input name="listen_port" type="number" min="1" max="65535" value="{{ default_port }}" placeholder="留空使用默认端口">
           <span class="sub">客户端连接的端口，可与默认端口不同。</span>
         </label>
         <label class="field">

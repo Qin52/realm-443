@@ -42,7 +42,7 @@ from flask import (
 from werkzeug.security import check_password_hash, generate_password_hash
 
 APP_NAME = "GOST SNI Manager"
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.2.0"
 DATA_DIR = Path(os.environ.get("GOST_PANEL_DATA", "/etc/gost-panel"))
 DB_FILE = Path(os.environ.get("GOST_PANEL_DB", str(DATA_DIR / "gsm.db")))
 SECRET_FILE = Path(os.environ.get("GOST_PANEL_SECRET", str(DATA_DIR / "secret.key")))
@@ -141,6 +141,7 @@ def create_app() -> Flask:
             status=status,
             settings=settings,
             apply_state=dict(APPLY_STATE),
+            default_port=default_listen_port(),
         )
 
     @app.post("/rules")
@@ -474,6 +475,40 @@ def validate_listen_port(port: int) -> None:
         raise ValueError(f"入站端口不能落在本地中继保留段 {RELAY_PORT_MIN}-{RELAY_PORT_MAX} 内。")
 
 
+def port_in_use(port: int) -> bool:
+    """True when any TCP listener already holds the port.
+
+    Checking with `ss` rather than a probe bind avoids briefly occupying the
+    port and avoids reporting a false negative on servers where SO_REUSEADDR
+    lets a second bind succeed.
+    """
+    if shutil.which("ss"):
+        code, out = run_cmd(["ss", "-ltnH", f"sport = :{port}"], allow_fail=True)
+        if code == 0:
+            return any(line.split()[0].startswith("LISTEN") for line in out.splitlines() if line.strip())
+    code, out = run_cmd(["bash", "-lc", f"ss -ltn 2>/dev/null | grep -E ':{port}\\b' || true"], allow_fail=True)
+    if code == 0 and out.strip():
+        return True
+    return False
+
+
+def validate_listen_port_available(port: int, keep: Optional[int] = None) -> None:
+    """Reject a new inbound port that another process already occupies.
+
+    GOST binds these ports itself, so a port held by anything else (another
+    GOST listener, a service, a stray process) can never serve the rule.
+    """
+    if keep is not None and port == keep:
+        return
+    if not port_in_use(port):
+        return
+    if port == default_listen_port():
+        return
+    if any(int(r.get("listen_port") or 0) == port for r in query_all("SELECT listen_port FROM rules")):
+        return
+    raise ValueError(f"入站端口 {port} 已被其他程序占用，请换一个。")
+
+
 def row_to_dict(row: sqlite3.Row | None) -> Optional[Dict[str, Any]]:
     return dict(row) if row is not None else None
 
@@ -777,6 +812,10 @@ def parse_rule_form(form, owner: Dict[str, Any], actor: Dict[str, Any], existing
         except ValueError as exc:
             raise ValueError("入站端口必须是数字。") from exc
     validate_listen_port(listen_port)
+    keep_port = None
+    if existing_rule and existing_rule.get("listen_port"):
+        keep_port = int(existing_rule["listen_port"])
+    validate_listen_port_available(listen_port, keep=keep_port)
 
     if actor["role"] == "admin":
         speed = parse_float_or_none(form.get("speed_limit_mbps", ""), "限速")
@@ -1092,22 +1131,44 @@ def generate_gost_config() -> str:
 
 _APPLY_LOCK = threading.Lock()
 _APPLY_TIMER: Optional[threading.Timer] = None
+_PREVIOUS_CONFIG = ""
 APPLY_STATE: Dict[str, Any] = {"pending": False, "last_at": None, "error": None}
 
 
 def write_gost_config() -> str:
+    """Render the config and validate it before it can reach the live service."""
     yaml_text = generate_gost_config()
+    validate_gost_config(yaml_text)
     atomic_write_text(GOST_CONFIG, yaml_text, mode=0o644)
     return yaml_text
 
 
-def schedule_apply(delay: Optional[float] = None) -> None:
-    """Restart GOST *after* the HTTP response has been flushed.
+def validate_gost_config(yaml_text: str) -> None:
+    """Structural check of the rendered config before it reaches the live service.
 
-    The panel is itself reached through GOST (443 -> Caddy), so restarting the
-    service while the request is still in flight kills the browser connection and
-    the user sees a connection error instead of the redirect target. Debouncing
-    also collapses a burst of edits into a single restart.
+    GOST has no dry-run flag (`-D` is debug mode and binds ports), and a reload
+    with an empty or truncated `services:` list silently drops every listener.
+    These checks catch that class of mistake; the real safety net is the
+    post-reload listener verification in `_apply_worker`.
+    """
+    lines = yaml_text.splitlines()
+    if not lines or lines[0].strip() != "services:":
+        raise RuntimeError("生成的 GOST 配置无效：缺少 services 段。")
+    service_names = [l for l in lines if l.startswith("- name: ")]
+    if not service_names:
+        raise RuntimeError("生成的 GOST 配置无效：没有任何转发服务。")
+    for required, label in (("  addr: ", "监听地址"), ("  handler:", "handler"), ("  forwarder:", "forwarder")):
+        if sum(1 for l in lines if l.startswith(required)) < len(service_names):
+            raise RuntimeError(f"生成的 GOST 配置无效：有服务缺少{label}。")
+
+
+def schedule_apply(delay: Optional[float] = None) -> None:
+    """Apply the GOST config *after* the HTTP response has been flushed.
+
+    The reload happens in a background thread so the redirect reaches the
+    browser first, and debouncing collapses a burst of edits into one reload.
+    GOST's SIGHUP reload keeps established sessions alive, so the panel's own
+    request path through GOST is not interrupted.
     """
     global _APPLY_TIMER
     delay = APPLY_DELAY if delay is None else delay
@@ -1123,16 +1184,52 @@ def schedule_apply(delay: Optional[float] = None) -> None:
 
 def _apply_worker() -> None:
     global _APPLY_TIMER
+    previous = _PREVIOUS_CONFIG
     with _APPLY_LOCK:
         _APPLY_TIMER = None
         APPLY_STATE["pending"] = False
     try:
         reload_gost_service()
+        time.sleep(float(os.environ.get("GOST_APPLY_VERIFY_DELAY", "2")))
+        verify_gost_running()
         sync_relay_service()
         APPLY_STATE["error"] = None
     except Exception as exc:  # background thread: record instead of raising
         APPLY_STATE["error"] = str(exc)
+        if previous:
+            try:
+                atomic_write_text(GOST_CONFIG, previous, mode=0o644)
+                reload_gost_service()
+                APPLY_STATE["error"] = f"{exc}（已回滚到上一份可用配置）"
+            except Exception as rollback_exc:
+                APPLY_STATE["error"] = f"{exc}；回滚也失败：{rollback_exc}"
     APPLY_STATE["last_at"] = utc_now()
+
+
+def verify_gost_running() -> None:
+    """Confirm GOST survived the reload and still listens on every expected port.
+
+    A bad reload (empty `services:`, unknown listener type) leaves the process
+    alive but the listeners closed, so `is-active` alone is not enough: a new
+    client would get connection refused while the panel looks healthy.
+    """
+    code, out = run_cmd(["systemctl", "is-active", GOST_SERVICE], allow_fail=True)
+    if code != 0 or out.strip() != "active":
+        raise RuntimeError(out.strip() or "GOST 重启后未处于运行状态")
+    expected = expected_listen_ports()
+    missing = [port for port in expected if not port_in_use(port)]
+    if missing:
+        ports = "、".join(str(p) for p in missing)
+        raise RuntimeError(f"GOST 没有监听预期端口 {ports}，配置可能已被拒绝")
+
+
+def expected_listen_ports() -> List[int]:
+    """Ports the freshly written config is supposed to bind."""
+    ports: List[int] = []
+    groups = group_rules_by_listen_port(active_rules_for_config(), default_listen_port())
+    for port in groups:
+        ports.append(int(port))
+    return sorted(set(ports))
 
 
 def reload_gost_service() -> None:
@@ -1167,8 +1264,15 @@ def reload_gost_service() -> None:
 
 
 def apply_config(restart: bool) -> None:
+    global _PREVIOUS_CONFIG
+    previous = ""
+    try:
+        previous = GOST_CONFIG.read_text(encoding="utf-8")
+    except OSError:
+        previous = ""
     write_gost_config()
     if restart:
+        _PREVIOUS_CONFIG = previous
         schedule_apply()
 
 
