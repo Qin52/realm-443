@@ -25,7 +25,7 @@ tar -czf - \
   --format=gnu \
   panel | base64 -w 76 > "${payload}"
 
-awk '/^__GSM_PAYLOAD_START__$/ {exit} {print}' install.sh > "${head_part}"
+awk '/^__gsm_payload__\(\)/ {exit} {print}' install.sh > "${head_part}"
 
 {
   cat "${head_part}"
