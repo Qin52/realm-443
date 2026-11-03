@@ -527,7 +527,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Qin52/realm-443/master/unins
 ## 注意事项
 
 1. 中转 VPS 的 443 必须由 GOST 监听。
-2. Caddy 的 fallback 站在 `bind 127.0.0.1` 上监听 8053，**只对本机开放**，只能经 GOST:443 进入，不能从公网直连绕过 SNI 校验。
+2. Caddy 的所有站点（面板域名站和 fallback 站）都用 `bind 127.0.0.1` 监听 8053，**只对本机开放**，只能经 GOST:443 进入，不能从公网直连绕过 SNI 校验。面板域名证书由 Caddy 通过 HTTP-01 申请，安装时 80 端口需要能从公网访问。
 3. 面板域名、网站域名需要解析到中转 VPS。
 4. 落地 VPS 的 REALITY SNI 必须和面板里的 SNI 一致。
 5. 客户端连接地址改成中转 VPS，SNI 仍保持落地 VPS 的 REALITY SNI。

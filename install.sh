@@ -379,6 +379,10 @@ write_caddyfile() {
 }
 
 https://${PANEL_DOMAIN} {
+    # 面板域名同样只听本机：公网 443 由 GOST 收，未知 SNI 再转给 Caddy。
+    # 不写 bind 会和下面的 fallback 站各开一个监听器，两个都想绑 :${CADDY_HTTPS_PORT}，
+    # Caddy 启动时直接报 bind: address already in use。
+    bind 127.0.0.1
     encode zstd gzip
     reverse_proxy 127.0.0.1:${PANEL_PORT}
 }
@@ -405,6 +409,11 @@ EOF2
 EOF2
   fi
   caddy fmt --overwrite /etc/caddy/Caddyfile || true
+  # Validate before any service restart so a bad Caddyfile fails loudly here.
+  if ! caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1; then
+    caddy validate --config /etc/caddy/Caddyfile >&2 || true
+    die "Caddyfile 校验失败：/etc/caddy/Caddyfile"
+  fi
 }
 
 start_services() {
@@ -418,11 +427,22 @@ start_services() {
   else
     systemctl disable --now gsm-relay >/dev/null 2>&1 || true
   fi
-  systemctl enable --now caddy
-  systemctl restart caddy
+  # Stop Caddy before restarting: an old unit keeps the fallback port
+  # bound and the new process fails with "bind: address already in use".
+  systemctl stop caddy >/dev/null 2>&1 || true
+  systemctl enable caddy >/dev/null 2>&1 || true
+  # GOST carries the actual forwarding, so it starts first: a Caddy problem
+  # must never leave the whole transit host without its 443 listener.
   systemctl enable --now gost
   systemctl restart gost
-  systemctl restart caddy || true
+  if systemctl restart caddy; then
+    return 0
+  fi
+  journalctl -u caddy -n 20 --no-pager 2>/dev/null | tail -n 20 >&2 || true
+  # The unknown-SNI fallback only serves the panel and any reverse-proxied
+  # site; the SNI rules keep working through GOST alone.
+  warn "Caddy 启动失败（GOST 已在运行，SNI 转发不受影响）。常见原因：${CADDY_HTTPS_PORT} 端口被占用或 Caddyfile 有误。"
+  warn "排查：journalctl -u caddy -n 50 --no-pager ；修好后 systemctl restart caddy"
 }
 
 write_credentials_file() {
