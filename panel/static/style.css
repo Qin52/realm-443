@@ -529,3 +529,67 @@ details.disclosure[open] > summary::after { content: "▴"; }
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; animation: none !important; }
 }
+
+/* ---------- 出口访问（egress） ---------- */
+
+.egress-card { margin-bottom: 18px; }
+.egress-card .card-head.between { flex-wrap: wrap; }
+
+.egress-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 14px;
+  padding: 14px 16px;
+  margin-bottom: 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+.egress-grid > div { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.egress-grid span { font-size: 12px; color: var(--muted); }
+.egress-grid strong { font-size: 13.5px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.egress-grid strong .pill { font-weight: 560; }
+.egress-grid strong small { font-size: 11.5px; color: var(--muted); font-weight: 500; }
+
+.egress-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  margin: 0 0 14px;
+  font-size: 12px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.egress-domains textarea {
+  min-height: 132px;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  line-height: 1.6;
+  resize: vertical;
+}
+
+.egress-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  padding-top: 16px;
+  margin-top: 4px;
+  border-top: 1px solid var(--border);
+}
+.egress-probe input[name="host"] { width: 150px; }
+.egress-probe input[name="port"] { width: 92px; }
+
+.egress-log-head { margin-top: 18px; margin-bottom: 10px; }
+.egress-log-head .egress-meta { margin: 0; }
+.egress-filter { margin-bottom: 14px; }
+.egress-filter .field { flex: 1 1 150px; min-width: 130px; max-width: 200px; }
+.egress-filter .field select { min-height: 34px; padding: 6px 30px 6px 10px; font-size: 13px; }
+
+@media (max-width: 760px) {
+  .egress-grid { padding: 12px; }
+  .egress-probe input[name="host"] { width: 100%; }
+  .egress-probe input[name="port"] { width: 90px; }
+  .egress-filter .field { max-width: none; }
+}

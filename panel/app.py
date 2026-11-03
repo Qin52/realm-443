@@ -43,8 +43,18 @@ from flask import (
 )
 from werkzeug.security import check_password_hash, generate_password_hash
 
+try:
+    # 出口访问守卫 egress.py 与面板同目录；缺少该模块时降级，
+    # 用 EGRESS_IMPORT_ERROR 记录原因，保证面板仍然能启动。
+    import egress
+except ImportError as exc:
+    egress = None  # type: ignore[assignment]
+    EGRESS_IMPORT_ERROR = str(exc)
+else:
+    EGRESS_IMPORT_ERROR = ""
+
 APP_NAME = "GOST SNI Manager"
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.3.0"
 DATA_DIR = Path(os.environ.get("GOST_PANEL_DATA", "/etc/gost-panel"))
 DB_FILE = Path(os.environ.get("GOST_PANEL_DB", str(DATA_DIR / "gsm.db")))
 SECRET_FILE = Path(os.environ.get("GOST_PANEL_SECRET", str(DATA_DIR / "secret.key")))
@@ -63,9 +73,224 @@ APPLY_DELAY = float(os.environ.get("GOST_APPLY_DELAY", "2.5"))
 PANEL_DOMAIN = os.environ.get("PANEL_DOMAIN", "").strip().lower()
 CERT_DIR = Path(os.environ.get("GOST_CERT_DIR", "/root/cert"))
 
+# 出口访问控制（契约第 6/7/8 节）：面板侧提示与日志页上限。
+EGRESS_UNAVAILABLE_TEXT = "本机未启用出口访问守卫（未安装 gsm-egress 或 GSM_EGRESS 未开启），该功能不可用。"
+EGRESS_LOG_LIMIT_DEFAULT = 50
+EGRESS_LOG_LIMIT_MAX = 200
+EGRESS_CLI_COMMANDS = (
+    "egress-show",
+    "egress-set",
+    "egress-apply",
+    "egress-log",
+    "egress-probe",
+    "egress-domains",
+    "egress-doctor",
+)
+
 DOMAIN_RE = re.compile(r"^(?=.{1,253}$)([A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$")
 HOST_RE = re.compile(r"^[A-Za-z0-9.-]+$|^\[[0-9A-Fa-f:.]+\]$")
 LISTEN_RE = re.compile(r"^(:\d{1,5}|[A-Za-z0-9.:-]+:\d{1,5}|\[[0-9A-Fa-f:.]+\]:\d{1,5})$")
+
+
+def egress_available() -> bool:
+    """出口守卫是否可用（模块缺失或本机未启用时一律为 False）。"""
+    if egress is None:
+        return False
+    try:
+        return bool(egress.egress_available())
+    except Exception as exc:  # 守卫探测失败不能把面板带崩
+        print(f"[warn] 出口守卫可用性判断失败：{exc}", file=sys.stderr)
+        return False
+
+
+def egress_notes() -> list[str]:
+    """面板启动时关于出口模块的诊断信息（仅提示，不影响运行）。"""
+    if egress is None:
+        return [f"出口访问守卫模块未加载：{EGRESS_IMPORT_ERROR or 'panel/egress.py 不存在'}"]
+    return []
+
+
+def egress_guard_response() -> Optional[Response]:
+    """契约第 7 节：守卫不可用时统一 flash 并回控制台。"""
+    if egress_available():
+        return None
+    flash(EGRESS_UNAVAILABLE_TEXT, "error")
+    return redirect(url_for("dashboard"))
+
+
+def egress_next_url(raw: Any = "") -> str:
+    """只接受以 "/" 开头的站内路径，其余（含 // 与反斜杠）一律回控制台。"""
+    candidate = str(raw or "").strip()
+    if re.fullmatch(r"/(?!/)[^\s\\]*", candidate):
+        return candidate
+    return url_for("dashboard")
+
+
+def egress_form_bool(name: str, default: bool = False) -> bool:
+    """解析表单布尔字段，兼容 checkbox、隐藏 0/1 与 select 三种写法。"""
+    values = [str(item).strip().lower() for item in request.form.getlist(name)]
+    if not values:
+        return default
+    truthy = {"1", "on", "true", "yes", "enabled"}
+    falsy = {"0", "off", "false", "no", "disabled"}
+    if any(item in truthy for item in values):
+        return True
+    if any(item in falsy for item in values):
+        return False
+    return default
+
+
+def egress_toggle_value(raw: Any) -> Optional[bool]:
+    """开关表单只认明确的开/关值，其余返回 None 交给调用方报错。"""
+    value = str(raw or "").strip().lower()
+    if value in {"1", "on", "true", "yes"}:
+        return True
+    if value in {"0", "off", "false", "no"}:
+        return False
+    return None
+
+
+def egress_log_action() -> str:
+    """日志页 action 查询参数，只允许 allow/block，其余视为不筛选。"""
+    action = str(request.args.get("action", "")).strip().lower()
+    return action if action in {"allow", "block"} else ""
+
+
+def egress_log_limit() -> int:
+    """日志页条数，默认 50，上限 200（契约第 7 节）。"""
+    raw = str(request.args.get("limit", "")).strip()
+    if not raw:
+        return EGRESS_LOG_LIMIT_DEFAULT
+    try:
+        limit = int(raw)
+    except ValueError:
+        return EGRESS_LOG_LIMIT_DEFAULT
+    return max(1, min(limit, EGRESS_LOG_LIMIT_MAX))
+
+
+def egress_summary_data() -> Dict[str, Any]:
+    """契约第 8 节 egress_summary()，模块缺失时给出可优雅降级的默认值。"""
+    fallback: Dict[str, Any] = {
+        "enabled": False,
+        "mode": "allowlist",
+        "mode_label": "白名单",
+        "domains": 0,
+        "backend": "none",
+        "ok": False,
+        "detail": EGRESS_IMPORT_ERROR or "出口访问守卫未加载",
+        "updated_at": "",
+        "updated_by": "",
+        "available": False,
+        "installed": False,
+        "block_quic": True,
+        "ipv6": True,
+        "domain_list": [],
+        "dns_servers": [],
+        "allow4_count": 0,
+        "allow6_count": 0,
+    }
+    if egress is None:
+        return fallback
+    try:
+        data = dict(egress.egress_summary())
+    except Exception as exc:
+        fallback["detail"] = f"读取出口状态失败：{exc}"
+        return fallback
+    for key, value in fallback.items():
+        data.setdefault(key, value)
+    return data
+
+
+def egress_state_data() -> Dict[str, Any]:
+    """契约第 8 节 egress_apply_state()，取不到时按"未下发"处理。"""
+    fallback: Dict[str, Any] = {
+        "ok": False,
+        "detail": EGRESS_IMPORT_ERROR or "出口访问守卫未加载",
+        "backend": "none",
+        "last_at": None,
+        "allow4_count": 0,
+        "allow6_count": 0,
+        "needs_apply": True,
+        "policy_hash": "",
+        "applied_hash": "",
+    }
+    if egress is None:
+        return fallback
+    try:
+        data = dict(egress.egress_apply_state())
+    except Exception as exc:
+        fallback["detail"] = f"读取下发状态失败：{exc}"
+        return fallback
+    for key, value in fallback.items():
+        data.setdefault(key, value)
+    return data
+
+
+def egress_stats_data() -> Dict[str, Any]:
+    """契约第 8 节 egress_log_stats()。"""
+    fallback: Dict[str, Any] = {"total": 0, "allow": 0, "block": 0, "last": None}
+    if egress is None:
+        return fallback
+    try:
+        data = dict(egress.egress_log_stats())
+    except Exception:
+        return fallback
+    for key, value in fallback.items():
+        data.setdefault(key, value)
+    return data
+
+
+def egress_logs_data(limit: int = 20, action: str = "") -> List[Dict[str, Any]]:
+    """契约第 8 节 egress_log_tail()，字段固定 at/domain/ip/port/action/reason。"""
+    if egress is None:
+        return []
+    try:
+        rows = egress.egress_log_tail(limit=limit, action=action)
+    except Exception:
+        return []
+    result: List[Dict[str, Any]] = []
+    for row in rows or []:
+        item = dict(row)
+        result.append({
+            "at": item.get("at", ""),
+            "domain": item.get("domain", ""),
+            "ip": item.get("ip", ""),
+            "port": item.get("port", 0),
+            "action": item.get("action", ""),
+            "reason": item.get("reason", ""),
+        })
+    return result
+
+
+def egress_actor() -> str:
+    """当前操作者名字，写进策略的 updated_by；取不到时留空。"""
+    user = get_current_user() or {}
+    return str(user.get("username", "") or "")
+
+
+def egress_apply_after_save(saved_message: str) -> None:
+    """保存策略后立即下发；失败时说明策略已保存、数据面仍全拒绝（契约第 7 节）。"""
+    try:
+        state = dict(egress.egress_apply_now(actor=egress_actor()))
+    except Exception as exc:
+        flash(f"{saved_message}但数据面下发失败：{exc}。策略已保存，当前数据面仍保持全拒绝。", "error")
+        return
+    if bool(state.get("ok")):
+        flash(saved_message, "success")
+        return
+    detail = str(state.get("detail", "") or "").strip() or "未知原因"
+    flash(f"{saved_message}但数据面下发失败：{detail}。策略已保存，当前数据面仍保持全拒绝。", "error")
+
+
+def egress_cli_argv(raw_args: Iterable[str]) -> Optional[List[str]]:
+    """把 app.py 的 egress-* 命令转成 egress.py 独立进程等价的参数列表。
+
+    例如 `python app.py egress-set --enable` <-> `python egress.py set --enable`。
+    """
+    args = [str(item) for item in raw_args]
+    if not args or args[0] not in EGRESS_CLI_COMMANDS:
+        return None
+    return [args[0][len("egress-"):]] + args[1:]
 
 
 def create_app() -> Flask:
@@ -94,6 +319,8 @@ def create_app() -> Flask:
             "fmt_limit": fmt_limit,
             "account_usage": account_usage if user else None,
             "cert_status": cert_status,
+            # 契约第 8 节：base.html 导航据此决定是否显示出口入口。
+            "egress_available": egress_available(),
         }
 
     @app.get("/login")
@@ -151,6 +378,11 @@ def create_app() -> Flask:
             default_port=default_listen_port(),
             panel_cert=panel_cert,
             cert_dir=str(CERT_DIR),
+            # 契约第 8 节：出口访问卡片所需变量，一定存在。
+            egress=egress_summary_data(),
+            egress_state=egress_state_data(),
+            egress_stats=egress_stats_data(),
+            egress_logs=egress_logs_data(limit=20),
         )
 
     @app.post("/rules")
@@ -378,6 +610,151 @@ def create_app() -> Flask:
         caddy_logs = run_cmd(["journalctl", "-u", CADDY_SERVICE, "-n", "60", "--no-pager"], allow_fail=True)[1]
         return render_template("logs.html", gost_logs=gost_logs, relay_logs=relay_logs, caddy_logs=caddy_logs)
 
+    # ---- 出口访问控制（契约第 7 节）：全部主账号 + CSRF，失败都 flash 后重定向 ----
+
+    @app.post("/egress/toggle")
+    @require_admin
+    @require_csrf
+    def toggle_egress() -> Response:
+        guard = egress_guard_response()
+        if guard is not None:
+            return guard
+        next_url = egress_next_url(request.form.get("next", ""))
+        enabled = egress_toggle_value(request.form.get("enabled"))
+        if enabled is None:
+            flash("出口开关参数不正确，已忽略本次操作。", "error")
+            return redirect(next_url)
+        try:
+            egress.save_egress_policy(enabled=enabled, actor=egress_actor())
+        except (ValueError, RuntimeError, OSError, sqlite3.Error) as exc:
+            flash(f"出口开关保存失败：{exc}", "error")
+            return redirect(next_url)
+        egress_apply_after_save("出口访问已打开。" if enabled else "出口访问已关闭。")
+        return redirect(next_url)
+
+    @app.post("/egress/settings")
+    @require_admin
+    @require_csrf
+    def update_egress() -> Response:
+        guard = egress_guard_response()
+        if guard is not None:
+            return guard
+        next_url = egress_next_url(request.form.get("next", ""))
+        changes: Dict[str, Any] = {}
+        mode = str(request.form.get("mode", "") or "").strip().lower()
+        if mode:
+            modes = tuple(getattr(egress, "EGRESS_MODES", ("allowlist", "all")))
+            if mode not in modes:
+                flash(f"出口模式不正确：{mode}。", "error")
+                return redirect(next_url)
+            changes["mode"] = mode
+        # 表单没出现的字段保持原值，避免前端漏字段时把策略清空。
+        for field in ("enabled", "block_quic", "ipv6"):
+            if field in request.form:
+                changes[field] = egress_form_bool(field, default=False)
+        if "domains" in request.form:
+            try:
+                changes["domains"] = egress.parse_domain_text(request.form.get("domains", ""))
+            except ValueError as exc:
+                flash(f"域名清单有误：{exc}", "error")
+                return redirect(next_url)
+        try:
+            egress.save_egress_policy(actor=egress_actor(), **changes)
+        except (ValueError, RuntimeError, OSError, sqlite3.Error) as exc:
+            flash(f"出口设置保存失败：{exc}", "error")
+            return redirect(next_url)
+        egress_apply_after_save("出口访问设置已保存。")
+        return redirect(next_url)
+
+    @app.post("/egress/probe")
+    @require_admin
+    @require_csrf
+    def probe_egress() -> Response:
+        guard = egress_guard_response()
+        if guard is not None:
+            return guard
+        next_url = egress_next_url(request.form.get("next", ""))
+        host = str(request.form.get("host", "") or "").strip()
+        port_raw = str(request.form.get("port", "") or "").strip() or "443"
+        if not host:
+            flash("请填写要探测的主机名或 IP。", "error")
+            return redirect(next_url)
+        try:
+            port = int(port_raw)
+        except ValueError:
+            flash("探测端口必须是 1-65535 的整数。", "error")
+            return redirect(next_url)
+        if not 1 <= port <= 65535:
+            flash("探测端口必须是 1-65535 的整数。", "error")
+            return redirect(next_url)
+        try:
+            result = dict(egress.egress_probe(host, port))
+        except (ValueError, RuntimeError, OSError) as exc:
+            flash(f"出口探测失败：{exc}", "error")
+            return redirect(next_url)
+        elapsed = result.get("elapsed_ms", 0)
+        detail = str(result.get("detail", "") or "").strip()
+        if result.get("ok"):
+            flash(f"出口探测 {host}:{port} 成功（{elapsed} ms）{detail}", "success")
+        else:
+            flash(f"出口探测 {host}:{port} 失败（{elapsed} ms）：{detail or '连接不成功'}", "error")
+        return redirect(next_url)
+
+    @app.get("/egress/log")
+    @require_admin
+    def egress_log_page() -> str | Response:
+        guard = egress_guard_response()
+        if guard is not None:
+            return guard
+        action = egress_log_action()
+        limit = egress_log_limit()
+        return render_template(
+            "egress_log.html",
+            egress=egress_summary_data(),
+            egress_state=egress_state_data(),
+            egress_stats=egress_stats_data(),
+            logs=egress_logs_data(limit=limit, action=action),
+            action=action,
+            limit=limit,
+        )
+
+    @app.get("/egress/log.json")
+    @require_admin
+    def egress_log_json() -> Response:
+        guard = egress_guard_response()
+        if guard is not None:
+            return guard
+        action = egress_log_action()
+        limit = egress_log_limit()
+        payload = {
+            "ok": True,
+            "action": action,
+            "limit": limit,
+            "stats": egress_stats_data(),
+            "items": egress_logs_data(limit=limit, action=action),
+        }
+        return Response(json.dumps(payload, ensure_ascii=False), mimetype="application/json")
+
+    @app.post("/egress/reapply")
+    @require_admin
+    @require_csrf
+    def reapply_egress() -> Response:
+        guard = egress_guard_response()
+        if guard is not None:
+            return guard
+        next_url = egress_next_url(request.form.get("next", ""))
+        try:
+            state = dict(egress.egress_apply_now(actor=egress_actor()))
+        except (ValueError, RuntimeError, OSError) as exc:
+            flash(f"重新下发出口策略失败：{exc}。数据面仍保持全拒绝。", "error")
+            return redirect(next_url)
+        if bool(state.get("ok")):
+            flash("出口策略已重新下发。", "success")
+        else:
+            detail = str(state.get("detail", "") or "").strip() or "未知原因"
+            flash(f"重新下发出口策略失败：{detail}。数据面仍保持全拒绝。", "error")
+        return redirect(next_url)
+
     return app
 
 
@@ -438,6 +815,13 @@ def init_db() -> None:
             """
         )
         migrate_schema(db)
+        # 出口访问控制表（契约第 6 节），旧数据库可直接升级；
+        # 没有守卫模块时跳过，且建表失败不应阻塞面板启动。
+        if egress is not None:
+            try:
+                egress.ensure_egress_schema()
+            except Exception as exc:
+                print(f"[warn] 出口访问表初始化失败：{exc}", file=sys.stderr)
         db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('listen',?)", (DEFAULT_LISTEN,))
         db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('fallback_addr',?)", (DEFAULT_FALLBACK,))
         db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('panel_domain',?)", (PANEL_DOMAIN,))
@@ -1617,7 +2001,18 @@ def parse_init_rules(raw: str, owner_id: str) -> List[Dict[str, Any]]:
     return rules
 
 
-def cli() -> int:
+def cli(argv: Optional[List[str]] = None) -> int:
+    # 契约第 6 节：app.py 的 egress-* 只做参数转发，交给 egress.egress_cli()，
+    # 转发前把命令名换成独立进程的写法（egress-show -> show）。
+    # 先于 init_db() 处理，避免在未启用守卫的机器上顺带建面板数据库。
+    raw_args = list(sys.argv[1:] if argv is None else argv)
+    forwarded = egress_cli_argv(raw_args)
+    if forwarded is not None:
+        if egress is None:
+            print(f"本机未启用出口访问守卫：{EGRESS_IMPORT_ERROR or 'panel/egress.py 不存在'}", file=sys.stderr)
+            return 1
+        return int(egress.egress_cli(forwarded))
+
     parser = argparse.ArgumentParser(description=APP_NAME)
     sub = parser.add_subparsers(dest="command")
 
@@ -1638,7 +2033,7 @@ def cli() -> int:
     sub.add_parser("render-config", help="write gost config from database")
     sub.add_parser("show-config", help="print gost config")
 
-    args = parser.parse_args()
+    args = parser.parse_args(raw_args)
     init_db()
     if args.command == "serve":
         app = create_app()

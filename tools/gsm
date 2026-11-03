@@ -1,0 +1,534 @@
+#!/usr/bin/env bash
+# gsm —— GOST SNI Manager 便携命令
+#
+# 用途：在 SSH 里不依赖面板、不依赖 jq、不依赖 tty 地查看和切换"出口访问"开关。
+# 设计约定（契约第 6/9 节）：
+#   * 判定与下发逻辑只有一套，全部在面板的 app.py / egress.py 里；
+#     本脚本只是胶水，通过 "python app.py egress-*" 子命令读写，绝不自己写 nft 规则。
+#   * allow/deny 先读 egress-domains，本地合并去重后再整体写回，避免并发覆盖。
+#   * app.py 的退出码原样透传：0 成功；1 参数错误或本机未启用守卫；3 已保存但下发失败。
+#   * 只用 bash 内建与系统自带命令（curl 安装场景下一般为最小系统），不要求 jq。
+#   * 全程不读 stdin（除显式文件重定向），非交互 SSH / 管道安装后可直接用。
+set -Eeuo pipefail
+
+GSM_VERSION="2.3.0"
+APP_DIR="${GSM_APP_DIR:-/opt/gost-sni-manager}"
+PY="${GSM_PYTHON:-}"
+PROBE_HOST_DEFAULT="${GSM_PROBE_HOST:-1.1.1.1}"
+PROBE_PORT_DEFAULT="${GSM_PROBE_PORT:-443}"
+LOG_DEFAULT_LINES="${GSM_LOG_LINES:-20}"
+
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  C_OK=$'\033[1;32m'
+  C_WARN=$'\033[1;33m'
+  C_ERR=$'\033[1;31m'
+  C_INFO=$'\033[1;36m'
+  C_OFF=$'\033[0m'
+else
+  C_OK="" C_WARN="" C_ERR="" C_INFO="" C_OFF=""
+fi
+
+ok()   { printf '%s[ok]%s %s\n' "${C_OK}" "${C_OFF}" "$*"; }
+warn() { printf '%s[!]%s %s\n' "${C_WARN}" "${C_OFF}" "$*"; }
+err()  { printf '%s[x]%s %s\n' "${C_ERR}" "${C_OFF}" "$*" >&2; }
+info() { printf '%s[>]%s %s\n' "${C_INFO}" "${C_OFF}" "$*"; }
+
+usage() {
+  cat <<'EOF'
+gsm —— GOST SNI Manager 便携命令（出口访问控制）
+
+用法：
+  gsm                      查看出口访问状态（同 gsm status）
+  gsm status               查看状态：开关、模式、域名数、数据面下发结果
+  gsm on [--mode all|allowlist] [--allow a.com,b.com]
+                           打开出口访问；默认沿用当前模式
+  gsm off                  关闭出口访问（关闭是默认态，关闭即全拒绝出站）
+  gsm allow a.com b.com    追加放行域名（不改开关状态）
+  gsm deny a.com           删除放行域名（不改开关状态）
+  gsm domains              列出当前放行域名
+  gsm test [host] [port]   出站连通性探测（默认 1.1.1.1 443）
+  gsm log [-n N] [--allow|--block]
+                           查看访问流水（采样记录，非全量审计）
+  gsm doctor               自检：守卫服务、nft 表、DNS、探测等
+  gsm install-cli          把本脚本安装到系统（需要 root）
+  gsm version              显示版本
+  gsm help                 显示本帮助
+
+环境变量：
+  GSM_APP_DIR    应用目录，默认 /opt/gost-sni-manager
+  GSM_PYTHON     指定 python 解释器（默认按 venv -> python3 -> python 探测）
+  NO_COLOR       设置为非空时关闭彩色输出
+
+退出码：0 成功；1 参数错误或本机未启用出口守卫；3 已保存但数据面下发失败。
+EOF
+}
+
+# ---------- 应用目录与解释器探测 ----------
+
+# 应用目录：GSM_APP_DIR 优先，其次 /opt/gost-sni-manager。
+resolve_app_dir() {
+  printf '%s' "${APP_DIR}"
+}
+
+# 解释器可用性探测：必须不读 stdin，且可能阻塞时要有超时。
+# curl 管道安装/非交互 SSH 场景下 stdin 可能已关闭，任何交互式探测都会把 gsm 挂死。
+python_usable() {
+  local candidate="$1"
+  [[ -n "${candidate}" && -x "${candidate}" ]] || return 1
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 5 "${candidate}" -c 'import sys' </dev/null >/dev/null 2>&1
+  else
+    "${candidate}" -c 'import sys' </dev/null >/dev/null 2>&1
+  fi
+}
+
+# python 解释器：GSM_PYTHON 显式指定时直接用它（不再探测）；
+# 否则按 $APP_DIR/venv/bin/python -> venv/bin/python3 -> python3 -> python 逐个探测。
+resolve_python() {
+  if [[ -n "${PY}" ]]; then
+    printf '%s' "${PY}"
+    return 0
+  fi
+  local app candidate
+  app="$(resolve_app_dir)"
+  for candidate in \
+    "${app}/venv/bin/python" \
+    "${app}/venv/bin/python3" \
+    "$(command -v python3 2>/dev/null || true)" \
+    "$(command -v python 2>/dev/null || true)"; do
+    if python_usable "${candidate}"; then
+      printf '%s' "${candidate}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# 前置检查：app.py 存在 + 能找到 python，成功时把解释器路径打印到 stdout。
+require_env() {
+  local app py
+  app="$(resolve_app_dir)"
+  if [[ ! -f "${app}/app.py" ]]; then
+    err "找不到 ${app}/app.py。请确认已安装 GOST SNI Manager，或用 GSM_APP_DIR 指定应用目录。"
+    return 1
+  fi
+  py="$(resolve_python)" || {
+    err "找不到可用的 python 解释器（已尝试 venv/bin/python、python3、python）。可用 GSM_PYTHON 指定。"
+    return 1
+  }
+  printf '%s' "${py}"
+}
+
+# 重要：本脚本是 set -Eeuo pipefail。简单命令一旦返回非 0，shell 会立刻退出，
+# 所以 "cmd; rc=$?" 这种写法在失败时根本走不到赋值，退出码虽然对但提示全丢。
+# 统一用下面的 if/else 形式取真实退出码（条件上下文不触发 set -e）。
+# 用法：capture_rc <变量名> <命令...>
+capture_rc() {
+  local __var_name="$1"; shift
+  local __rc=0
+  if "$@"; then
+    __rc=0
+  else
+    __rc=$?
+  fi
+  printf -v "${__var_name}" '%s' "${__rc}"
+  return 0
+}
+
+# 取值型调用：成功时把 stdout 写进变量，同时返回 app.py 的真实退出码。
+# 用法：capture_app_out <变量名> <app.py 子命令...>
+capture_app_out() {
+  local __var_name="$1"; shift
+  local py app __out="" __rc=0
+  py="$(require_env)" || return 1
+  app="$(resolve_app_dir)"
+  if __out="$("${py}" "${app}/app.py" "$@")"; then
+    __rc=0
+  else
+    __rc=$?
+    __out=""
+  fi
+  printf -v "${__var_name}" '%s' "${__out}"
+  return "${__rc}"
+}
+
+# 流式调用：直接透传 app.py 的输出，返回真实退出码。
+run_app() {
+  local py app rc=0
+  py="$(require_env)" || return 1
+  app="$(resolve_app_dir)"
+  capture_rc rc "${py}" "${app}/app.py" "$@"
+  return "${rc}"
+}
+
+# 把 app.py 的退出码翻译成契约措辞：
+#   0 成功；1 参数/校验错误或本机未启用守卫；3 已保存但数据面下发失败。
+explain_rc() {
+  case "$1" in
+    0) printf '%s' "成功" ;;
+    1) printf '%s' "参数或校验错误，或本机未启用出口守卫（未改动策略）" ;;
+    3) printf '%s' "策略已保存，但数据面下发失败——数据面仍保持全拒绝" ;;
+    *) printf '%s' "退出码 $1" ;;
+  esac
+}
+
+# ---------- 域名清单合并 ----------
+
+# 规范化一个域名/IP：清掉控制字符与两侧空白、转小写、去掉末尾的点。
+normalize_token() {
+  local token="$1"
+  token="${token#"${token%%[![:space:]]*}"}"
+  token="${token%"${token##*[![:space:]]}"}"
+  token="$(printf '%s' "${token}" | tr -d '\r\n\t')"
+  token="${token,,}"
+  # 只去掉"末尾"的点。模式必须写 *.，写成 *.* 会匹配任何含点的域名 -> 死循环。
+  while [[ "${token}" == *. ]]; do
+    token="${token%.}"
+  done
+  printf '%s' "${token}"
+}
+
+# 读取当前放行域名（每行一个），成功时输出到 stdout，失败返回 app.py 的退出码。
+load_domains() {
+  local out="" rc=0
+  capture_app_out out egress-domains
+  rc=$?
+  printf '%s\n' "${out}"
+  return "${rc}"
+}
+
+# 合并写回：$@ 为要追加的域名。已有清单保持原样，整体去重后写回。
+apply_domains() {
+  local py app list_file merged rc=0 line token
+  py="$(require_env)" || return 1
+  app="$(resolve_app_dir)"
+
+  # 先确认能读到当前清单：读取失败时绝不能当空清单写回，否则会误删已有规则。
+  list_file="$(mktemp)"
+  capture_rc rc load_domains
+  local load_rc="${rc}"
+  if (( load_rc != 0 )); then
+    rm -f "${list_file}"
+    return "${load_rc}"
+  fi
+  load_domains > "${list_file}" || true
+
+  declare -A seen=()
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    line="$(normalize_token "${line}")"
+    [[ -z "${line}" ]] && continue
+    seen["${line}"]=1
+  done < "${list_file}"
+  rm -f "${list_file}"
+
+  for token in "$@"; do
+    token="$(normalize_token "${token}")"
+    [[ -z "${token}" ]] && continue
+    seen["${token}"]=1
+  done
+
+  # 排序输出：同一份清单每次写回结果一致，便于比对与回滚。
+  merged="$(mktemp)"
+  if (( ${#seen[@]} > 0 )); then
+    printf '%s\n' "${!seen[@]}" | LC_ALL=C sort > "${merged}"
+  else
+    : > "${merged}"
+  fi
+
+  capture_rc rc "${py}" "${app}/app.py" egress-set --domains-file "${merged}"
+  rm -f "${merged}"
+  return "${rc}"
+}
+
+# ---------- 子命令 ----------
+
+cmd_status() {
+  local rc=0
+  capture_rc rc run_app egress-show
+  if (( rc != 0 )); then
+    err "读取出口状态失败（退出码 ${rc}）：$(explain_rc "${rc}")。"
+    return "${rc}"
+  fi
+  ok "状态读取完成"
+}
+
+cmd_on() {
+  local mode="" allow="" item rc=0
+  local -a domains=() extra=()
+  while (( $# > 0 )); do
+    case "$1" in
+      --mode)
+        [[ $# -ge 2 ]] || { err "--mode 需要一个取值：all 或 allowlist"; return 1; }
+        mode="$2"; shift 2 ;;
+      --mode=*)
+        mode="${1#--mode=}"; shift ;;
+      --allow)
+        [[ $# -ge 2 ]] || { err "--allow 需要一个逗号分隔的域名列表"; return 1; }
+        allow="$2"; shift 2 ;;
+      --allow=*)
+        allow="${1#--allow=}"; shift ;;
+      *)
+        err "未知参数：$1"; return 1 ;;
+    esac
+  done
+
+  case "${mode}" in
+    ""|all|allowlist) ;;
+    *) err "--mode 只能是 all 或 allowlist，收到：${mode}"; return 1 ;;
+  esac
+
+  # 第一步：补域名（不改开关）。失败则开关保持原样。
+  if [[ -n "${allow}" ]]; then
+    local IFS=','
+    for item in ${allow}; do
+      [[ -n "${item}" ]] && domains+=("${item}")
+    done
+    if (( ${#domains[@]} > 0 )); then
+      capture_rc rc apply_domains "${domains[@]}"
+      if (( rc != 0 )); then
+        err "写入放行域名失败（退出码 ${rc}）：$(explain_rc "${rc}")。"
+        err "开关尚未改动，出口访问保持原状态。"
+        return "${rc}"
+      fi
+      ok "已追加放行域名：${domains[*]}"
+    fi
+  fi
+
+  # 第二步：改开关；保存成功但下发失败时按契约返回 3，并说明开关已改动。
+  extra=(egress-set --enable)
+  [[ -n "${mode}" ]] && extra+=(--mode "${mode}")
+  capture_rc rc run_app "${extra[@]}"
+  if (( rc == 3 )); then
+    err "开关已改动（策略已保存），但数据面下发失败：$(explain_rc "${rc}")。"
+    return 3
+  elif (( rc != 0 )); then
+    err "打开出口访问失败（退出码 ${rc}）：$(explain_rc "${rc}")。开关未生效。"
+    return "${rc}"
+  fi
+  ok "出口访问已打开${mode:+（模式：${mode}）}。"
+  cmd_status || true
+}
+
+cmd_off() {
+  local rc=0
+  capture_rc rc run_app egress-set --disable
+  if (( rc == 3 )); then
+    err "开关已改动（策略已保存），但数据面下发失败：$(explain_rc "${rc}")。"
+    return 3
+  elif (( rc != 0 )); then
+    err "关闭出口访问失败（退出码 ${rc}）：$(explain_rc "${rc}")。开关未生效。"
+    return "${rc}"
+  fi
+  ok "出口访问已关闭（所有出站被拒绝）。"
+  cmd_status || true
+}
+
+cmd_domains() {
+  local out="" rc=0
+  capture_app_out out egress-domains
+  rc=$?
+  if (( rc != 0 )); then
+    err "读取放行域名失败（退出码 ${rc}）：$(explain_rc "${rc}")。"
+    return "${rc}"
+  fi
+  if [[ -z "${out}" ]]; then
+    warn "当前没有放行域名（allowlist 模式下会拒绝所有出站）。"
+    return 0
+  fi
+  printf '%s\n' "${out}"
+}
+
+cmd_allow() {
+  if (( $# == 0 )); then
+    err "用法：gsm allow a.com b.com"
+    return 1
+  fi
+  local rc=0
+  capture_rc rc apply_domains "$@"
+  if (( rc != 0 )); then
+    err "追加放行域名失败（退出码 ${rc}）：$(explain_rc "${rc}")。"
+    return "${rc}"
+  fi
+  ok "已追加放行域名：$*"
+  cmd_domains
+}
+
+cmd_deny() {
+  if (( $# == 0 )); then
+    err "用法：gsm deny a.com"
+    return 1
+  fi
+  local py app rc=0 line token kept=0
+  py="$(require_env)" || return 1
+  app="$(resolve_app_dir)"
+
+  local -A drop=()
+  for token in "$@"; do
+    token="$(normalize_token "${token}")"
+    [[ -n "${token}" ]] && drop["${token}"]=1
+  done
+
+  local old_file keep_file
+  old_file="$(mktemp)"
+  keep_file="$(mktemp)"
+  capture_rc rc load_domains
+  local load_rc="${rc}"
+  if (( load_rc != 0 )); then
+    rm -f "${old_file}" "${keep_file}"
+    err "读取放行域名失败（退出码 ${load_rc}）：$(explain_rc "${load_rc}")。"
+    return "${load_rc}"
+  fi
+  load_domains > "${old_file}" || true
+
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    line="$(normalize_token "${line}")"
+    [[ -z "${line}" ]] && continue
+    if [[ -n "${drop[${line}]:-}" ]]; then
+      continue
+    fi
+    printf '%s\n' "${line}" >> "${keep_file}"
+    kept=$((kept + 1))
+  done < "${old_file}"
+  rm -f "${old_file}"
+
+  capture_rc rc "${py}" "${app}/app.py" egress-set --domains-file "${keep_file}"
+  rm -f "${keep_file}"
+  if (( rc != 0 )); then
+    err "删除放行域名失败（退出码 ${rc}）：$(explain_rc "${rc}")。"
+    return "${rc}"
+  fi
+  ok "已删除放行域名：$*（剩余 ${kept} 条）"
+  cmd_domains
+}
+
+cmd_test() {
+  local host="${1:-${PROBE_HOST_DEFAULT}}"
+  local port="${2:-${PROBE_PORT_DEFAULT}}"
+  if ! [[ "${port}" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+    err "端口无效：${port}"
+    return 1
+  fi
+  local rc=0
+  capture_rc rc run_app egress-probe --host "${host}" --port "${port}"
+  if (( rc != 0 )); then
+    err "出站探测失败（退出码 ${rc}）：$(explain_rc "${rc}")。"
+    return "${rc}"
+  fi
+  ok "探测完成：${host}:${port}"
+}
+
+cmd_log() {
+  local lines="${LOG_DEFAULT_LINES}" action="" rc=0
+  local -a args=()
+  while (( $# > 0 )); do
+    case "$1" in
+      -n|--lines)
+        [[ $# -ge 2 ]] || { err "-n 需要一个数字"; return 1; }
+        lines="$2"; shift 2 ;;
+      -n*)
+        lines="${1#-n}"; shift ;;
+      --allow) action="allow"; shift ;;
+      --block) action="block"; shift ;;
+      *)
+        err "未知参数：$1"; return 1 ;;
+    esac
+  done
+  if ! [[ "${lines}" =~ ^[0-9]+$ ]] || (( lines < 1 )); then
+    err "-n 需要一个正整数，收到：${lines}"
+    return 1
+  fi
+
+  args=(egress-log --limit "${lines}")
+  [[ -n "${action}" ]] && args+=(--action "${action}")
+  capture_rc rc run_app "${args[@]}"
+  if (( rc != 0 )); then
+    err "读取访问流水失败（退出码 ${rc}）：$(explain_rc "${rc}")。"
+    return "${rc}"
+  fi
+  ok "访问流水（最近 ${lines} 条${action:+，筛选：${action}}）"
+}
+
+cmd_doctor() {
+  local rc=0
+  capture_rc rc run_app egress-doctor
+  case "${rc}" in
+    0) ok "自检通过。" ;;
+    1) warn "自检发现问题（退出码 1），详见上面的输出。" ;;
+    *) err "自检执行失败（退出码 ${rc}）。" ;;
+  esac
+  return "${rc}"
+}
+
+cmd_install_cli() {
+  local app src dst rc=0
+  app="$(resolve_app_dir)"
+  src="${BASH_SOURCE[0]:-}"
+  dst="${app}/tools/gsm"
+
+  if [[ "${EUID}" -ne 0 ]]; then
+    err "安装 gsm 命令需要 root，请用：sudo gsm install-cli"
+    return 1
+  fi
+  if [[ -z "${src}" || ! -f "${src}" ]]; then
+    err "找不到自身脚本路径，无法安装。请手动复制到 ${dst}。"
+    return 1
+  fi
+  if [[ "${src}" -ef "${dst}" ]]; then
+    ok "已在 ${dst}，跳过复制。"
+  else
+    capture_rc rc mkdir -p "${app}/tools"
+    if (( rc == 0 )); then
+      capture_rc rc install -m 0755 "${src}" "${dst}"
+    fi
+    if (( rc != 0 )); then
+      err "复制到 ${dst} 失败（退出码 ${rc}）。"
+      return "${rc}"
+    fi
+    ok "已安装：${dst}"
+  fi
+
+  capture_rc rc ln -sf "${dst}" /usr/local/bin/gsm
+  if (( rc != 0 )); then
+    err "创建符号链接 /usr/local/bin/gsm 失败（退出码 ${rc}）。"
+    return "${rc}"
+  fi
+  ok "已创建符号链接：/usr/local/bin/gsm -> ${dst}"
+  info "现在可以直接运行：gsm status"
+}
+
+cmd_version() {
+  printf 'gsm %s\n' "${GSM_VERSION}"
+  local py app
+  if py="$(resolve_python)" && app="$(resolve_app_dir)" && [[ -f "${app}/app.py" ]]; then
+    printf 'app.py: %s\n' "${app}/app.py"
+    printf 'python: %s\n' "${py}"
+  fi
+}
+
+main() {
+  local cmd="${1:-status}"
+  if (( $# > 0 )); then
+    shift
+  fi
+  case "${cmd}" in
+    status|show)          cmd_status "$@" ;;
+    on|enable)            cmd_on "$@" ;;
+    off|disable)          cmd_off "$@" ;;
+    allow|add)            cmd_allow "$@" ;;
+    deny|del|remove)      cmd_deny "$@" ;;
+    domains|list)         cmd_domains "$@" ;;
+    test|probe)           cmd_test "$@" ;;
+    log|logs)             cmd_log "$@" ;;
+    doctor|diag)          cmd_doctor "$@" ;;
+    install-cli|install)  cmd_install_cli "$@" ;;
+    version|-v|--version) cmd_version "$@" ;;
+    help|-h|--help)       usage ;;
+    *)
+      err "未知命令：${cmd}"
+      usage >&2
+      return 1
+      ;;
+  esac
+}
+
+main "$@"

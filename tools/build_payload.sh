@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
-# Rebuild the base64 panel payload embedded at the bottom of install.sh.
+# Rebuild the base64 payload embedded at the bottom of install.sh.
 #
-# install.sh is a self-contained installer: it carries panel/ as a gzip'd tar
-# archive after the `__GSM_PAYLOAD_START__` marker. Editing panel/* alone does
-# not change what gets installed, so run this after every panel change:
+# install.sh is a self-contained installer: it carries panel/ and tools/ as a
+# gzip'd tar archive after the `__GSM_PAYLOAD_START__` marker. Editing panel/*
+# or tools/* alone does not change what gets installed, so run this after any
+# such change:
 #
 #     ./tools/build_payload.sh && git commit -am "chore: rebuild payload"
+#
+# Payload layout (extract_payload() in install.sh returns this root):
+#   panel/...   面板与守卫（app.py / egress.py / relay.py / templates / static）
+#   tools/gsm   便携命令（install.sh 会复制到 ${INSTALL_DIR}/tools/gsm）
 set -Eeuo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
@@ -13,17 +18,19 @@ cd "${repo_root}"
 
 [[ -f install.sh ]] || { echo "install.sh not found in ${repo_root}" >&2; exit 1; }
 [[ -f panel/app.py ]] || { echo "panel/app.py not found" >&2; exit 1; }
+[[ -f tools/gsm ]] || { echo "tools/gsm not found" >&2; exit 1; }
 
 payload="$(mktemp)"
 head_part="$(mktemp)"
 
-# Package exactly what install_panel_files() expects to copy: the panel dir.
+# Package exactly what install_panel_files() expects to copy: panel/ + tools/.
+# tools/ 里只带 gsm（check_egress_nft.sh 是仓库内的回归工具，装机不需要）。
 tar -czf - \
   --exclude='__pycache__' \
   --exclude='*.pyc' \
   --exclude='.venv' \
   --format=gnu \
-  panel | base64 -w 76 > "${payload}"
+  panel tools/gsm | base64 -w 76 > "${payload}"
 
 awk '/^__gsm_payload__\(\)/ {exit} {print}' install.sh > "${head_part}"
 

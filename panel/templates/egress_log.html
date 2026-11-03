@@ -1,0 +1,130 @@
+{% extends "base.html" %}
+{% block title %}出口访问流水 - {{ app_name }}{% endblock %}
+{% set eg = egress if egress else {} %}
+{% set st = egress_stats if egress_stats else {} %}
+{% set ast = egress_state if egress_state else {} %}
+{% block content %}
+
+<div class="page-head">
+  <div class="grow">
+    <h1 class="page-title">出口访问</h1>
+    <p class="page-desc">出口机的出站放行 / 拦截流水。nft 日志按 12 条/分钟限速采样，这里只是采样记录，不是全量审计。</p>
+  </div>
+  <div class="page-actions">
+    <a class="btn btn-ghost" href="{{ url_for('dashboard') }}">返回控制台</a>
+  </div>
+</div>
+
+<section class="stats">
+  <div class="stat">
+    <span class="stat-label">开关</span>
+    <div class="stat-value">
+      <span class="pill {{ 'ok' if eg.get('enabled') else 'muted' }}">{{ '已开启' if eg.get('enabled') else '已关闭' }}</span>
+    </div>
+  </div>
+  <div class="stat">
+    <span class="stat-label">模式</span>
+    <div class="stat-value">{{ eg.get('mode_label')|default('域名白名单' if eg.get('mode') == 'allowlist' else '全部放行', true) }}</div>
+  </div>
+  <div class="stat">
+    <span class="stat-label">数据面</span>
+    <div class="stat-value">
+      <span class="pill {{ 'ok' if ast.get('ok') else 'bad' }}">{{ '正常' if ast.get('ok') else '异常' }}</span>
+      <small class="mono">{{ ast.get('backend')|default('none', true) }}</small>
+    </div>
+  </div>
+  <div class="stat">
+    <span class="stat-label">放行</span>
+    <div class="stat-value">{{ st.get('allow')|default(0, true) }}</div>
+  </div>
+  <div class="stat">
+    <span class="stat-label">拒绝</span>
+    <div class="stat-value">{{ st.get('block')|default(0, true) }}</div>
+  </div>
+  <div class="stat">
+    <span class="stat-label">合计</span>
+    <div class="stat-value">{{ st.get('total')|default(0, true) }}</div>
+  </div>
+</section>
+
+{% if ast.get('needs_apply') %}
+<div class="banner warn">策略已保存但尚未下发到数据面（未生效），当前数据面仍保持全拒绝。可在控制台点“重新下发”。</div>
+{% endif %}
+{% if not ast.get('ok') %}
+<div class="banner warn">数据面状态异常：{{ ast.get('detail') or eg.get('detail') or '未知原因' }}。请检查 gsm-egress 服务与 nftables。</div>
+{% endif %}
+
+<section class="card">
+  <div class="card-head between">
+    <div>
+      <span class="kicker">访问流水</span>
+      <h2 class="card-title">最近的放行与拦截</h2>
+      <p class="card-hint">筛选只影响本页显示，不会改动策略；更多细节可看 <code>journalctl -k</code> 中的 <code>gsm-egress-</code> 前缀行。</p>
+    </div>
+    <span class="pill muted no-dot">共 {{ st.get('total')|default(0, true) }} 条</span>
+  </div>
+
+  <form method="get" action="{{ url_for('egress_log_page') }}" class="actions-row egress-filter">
+    <label class="field">
+      <span>动作</span>
+      <select name="action">
+        <option value="" {{ 'selected' if not action else '' }}>全部</option>
+        <option value="allow" {{ 'selected' if action == 'allow' else '' }}>仅放行</option>
+        <option value="block" {{ 'selected' if action == 'block' else '' }}>仅拦截</option>
+      </select>
+    </label>
+    <label class="field">
+      <span>条数</span>
+      <select name="limit">
+        {% if limit and (limit|int) not in [50, 100, 200] %}
+        <option value="{{ limit }}" selected>{{ limit }} 条</option>
+        {% endif %}
+        {% for n in [50, 100, 200] %}
+        <option value="{{ n }}" {{ 'selected' if (limit|int) == n else '' }}>{{ n }} 条</option>
+        {% endfor %}
+      </select>
+    </label>
+    <button class="btn btn-primary" type="submit">筛选</button>
+    <a class="btn btn-ghost" href="{{ url_for('egress_log_page') }}">重置</a>
+  </form>
+
+  {% if logs %}
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>时间</th>
+          <th>动作</th>
+          <th>域名</th>
+          <th>目标</th>
+          <th>端口</th>
+          <th>原因</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for row in logs %}
+        {% set act = row.get('action', '') %}
+        <tr>
+          <td data-label="时间"><span class="mono">{{ row.get('at') or '-' }}</span></td>
+          <td data-label="动作">
+            <span class="pill {{ 'ok' if act == 'allow' else 'bad' }} no-dot">{{ '放行' if act == 'allow' else ('拦截' if act == 'block' else (act or '-')) }}</span>
+          </td>
+          <td data-label="域名">{{ row.get('domain') or '-' }}</td>
+          <td data-label="目标"><span class="mono">{{ row.get('ip') or '-' }}</span></td>
+          <td data-label="端口">{{ row.get('port') if row.get('port') is not none else 0 }}</td>
+          <td data-label="原因">{{ row.get('reason') or '-' }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="empty">
+    <h3>还没有{{ '放行' if action == 'allow' else ('拦截' if action == 'block' else '访问') }}流水</h3>
+    <p>数据面还没有记录，或者出口守卫未启动。出口机产生放行或拦截后，这里会出现采样记录；若一直为空，先确认 <code>gsm-egress</code> 服务在运行，且内核日志可读（<code>/dev/kmsg</code> 或 <code>journalctl -k</code>）。</p>
+  </div>
+  {% endif %}
+</section>
+
+<p class="footer-note">{{ app_name }} v{{ version }} · 出口访问 {{ 'v4 ' ~ (ast.get('allow4_count')|default(0, true)) ~ ' / v6 ' ~ (ast.get('allow6_count')|default(0, true)) }} 条放行地址</p>
+{% endblock %}

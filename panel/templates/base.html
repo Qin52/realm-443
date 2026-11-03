@@ -23,6 +23,9 @@
       <a class="nav-link {{ 'is-active' if request.endpoint == 'logs' }}" href="{{ url_for('logs') }}">日志</a>
       {% if is_admin %}
       <a class="nav-link" href="{{ url_for('view_config') }}">实时配置</a>
+      {% if egress_available and (not egress or egress.get('available', True)) %}
+      <a class="nav-link {{ 'is-active' if request.endpoint == 'egress_log_page' else '' }}" href="{{ url_for('egress_log_page') }}">出口访问</a>
+      {% endif %}
       {% endif %}
     </nav>
     <div class="topbar-right">

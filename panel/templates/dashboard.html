@@ -19,6 +19,191 @@
   </div>
 </div>
 
+{# ===== 出口访问（契约第 7/8 节）：仅守卫可用时渲染，字段缺失一律降级 ===== #}
+{% if egress and egress.get('available') %}
+{% set eg_state = egress_state if egress_state else {} %}
+{% set eg_stats = egress_stats if egress_stats else {} %}
+{% set eg_domains = egress.get('domain_list') or [] %}
+{% set eg_mode = egress.get('mode') or 'allowlist' %}
+{% set eg_enabled = egress.get('enabled') %}
+<section class="card egress-card" id="egress">
+  <div class="card-head between">
+    <div>
+      <span class="kicker">出口访问</span>
+      <h2 class="card-title">出站访问控制</h2>
+      <p class="card-hint">出口机默认拒绝全部出站流量；只有在这里打开并命中白名单（或选择全部放行）时，出站才会被放行。策略由 <code>gsm-egress</code> 守护进程实时下发，不需要重启服务。</p>
+    </div>
+    <div class="actions-row">
+      <span class="pill {{ 'ok' if eg_enabled else 'muted' }}">{{ '已开启' if eg_enabled else '已关闭' }}</span>
+      <form method="post" action="{{ url_for('toggle_egress') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="enabled" value="{{ '0' if eg_enabled else '1' }}">
+        <input type="hidden" name="next" value="{{ url_for('dashboard') }}">
+        <button class="btn btn-sm {{ 'btn-danger' if eg_enabled else 'btn-primary' }}" type="submit">{{ '关闭出口访问' if eg_enabled else '打开出口访问' }}</button>
+      </form>
+    </div>
+  </div>
+
+  {% if eg_state.get('needs_apply') %}
+  <div class="banner warn">策略已保存但尚未下发到数据面（未生效）。点“重新下发”让策略生效；在此之前数据面仍保持全拒绝。</div>
+  {% endif %}
+  {% if not egress.get('ok') %}
+  <div class="banner warn">数据面状态异常：{{ eg_state.get('detail') or egress.get('detail') or '未知原因' }}。策略已保存的情况下数据面仍会回落到全拒绝。</div>
+  {% endif %}
+
+  <div class="egress-grid">
+    <div>
+      <span>开关状态</span>
+      <strong><span class="pill {{ 'ok' if eg_enabled else 'bad' }}">{{ '开启' if eg_enabled else '关闭' }}</span></strong>
+    </div>
+    <div>
+      <span>模式</span>
+      <strong>{{ egress.get('mode_label')|default('域名白名单' if eg_mode == 'allowlist' else '全部放行', true) }}</strong>
+    </div>
+    <div>
+      <span>数据面</span>
+      <strong><span class="pill {{ 'ok' if egress.get('ok') else 'bad' }}">{{ '正常' if egress.get('ok') else '异常' }}</span> <small class="mono">{{ egress.get('backend')|default('none', true) }}</small></strong>
+    </div>
+    <div>
+      <span>放行地址</span>
+      <strong class="mono">v4 {{ egress.get('allow4_count')|default(eg_state.get('allow4_count'), true) }} / v6 {{ egress.get('allow6_count')|default(eg_state.get('allow6_count'), true) }}</strong>
+    </div>
+    <div>
+      <span>域名数量</span>
+      <strong>{{ egress.get('domains')|default(eg_domains|length, true) }}</strong>
+    </div>
+    <div>
+      <span>最近更新</span>
+      <strong class="mono">{{ egress.get('updated_at') or '尚未修改' }}</strong>
+      <small class="hint">操作人：{{ egress.get('updated_by') or '-' }}</small>
+    </div>
+  </div>
+
+  {% if eg_state.get('detail') or egress.get('detail') %}
+  <p class="egress-meta">
+    <span>下发状态：{{ eg_state.get('detail') or egress.get('detail') }}</span>
+    <span>最近下发：{{ eg_state.get('last_at') or '未下发' }}</span>
+    {% if egress.get('dns_servers') %}<span>DNS：{{ egress.get('dns_servers')|join('、') }}</span>{% endif %}
+  </p>
+  {% endif %}
+
+  <form method="post" action="{{ url_for('update_egress') }}" class="form-grid egress-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="next" value="{{ url_for('dashboard') }}">
+    <div class="form-row">
+      <label class="field">
+        <span>出口开关</span>
+        <span class="checkbox">
+          <input type="hidden" name="enabled" value="0">
+          <input type="checkbox" name="enabled" value="1" {{ 'checked' if eg_enabled else '' }}>
+          允许本机访问外网
+        </span>
+        <span class="sub">关闭时数据面全拒绝、DNS 也会被挡，等价于断开所有出站。</span>
+      </label>
+      <label class="field">
+        <span>放行模式</span>
+        <select name="mode">
+          <option value="allowlist" {{ 'selected' if eg_mode == 'allowlist' else '' }}>域名白名单（只放行清单内的域名/IP）</option>
+          <option value="all" {{ 'selected' if eg_mode == 'all' else '' }}>全部放行（不限制出站目标）</option>
+        </select>
+        <span class="sub">白名单里的 <code>example.com</code> 同时覆盖 <code>*.example.com</code>。</span>
+      </label>
+    </div>
+    <label class="field egress-domains">
+      <span>域名白名单（每行一个域名或 IP）</span>
+      <textarea name="domains" rows="6" spellcheck="false" placeholder="github.com&#10;api.openai.com&#10;203.0.113.10">{% for d in eg_domains %}{{ d }}
+{% endfor %}</textarea>
+      <span class="sub">支持域名与 IPv4/IPv6 字面量，大小写不敏感；留空则白名单模式下什么都不放行。</span>
+    </label>
+    <div class="form-row">
+      <label class="field">
+        <span>其它选项</span>
+        <span class="checkbox">
+          <input type="hidden" name="block_quic" value="0">
+          <input type="checkbox" name="block_quic" value="1" {{ 'checked' if egress.get('block_quic', true) else '' }}>
+          丢弃 UDP/443（QUIC），逼客户端走 TCP
+        </span>
+        <span class="checkbox">
+          <input type="hidden" name="ipv6" value="0">
+          <input type="checkbox" name="ipv6" value="1" {{ 'checked' if egress.get('ipv6', true) else '' }}>
+          同时守护 IPv6
+        </span>
+      </label>
+      <div class="field">
+        <span>保存</span>
+        <button class="btn btn-primary" type="submit">保存并下发</button>
+        <span class="sub">保存后立即下发；下发失败时策略仍保存，数据面回落到全拒绝。</span>
+      </div>
+    </div>
+  </form>
+
+  <div class="egress-actions">
+    <form method="post" action="{{ url_for('reapply_egress') }}" class="actions-row">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="next" value="{{ url_for('dashboard') }}">
+      <button class="btn btn-sm" type="submit">重新下发</button>
+    </form>
+    <form method="post" action="{{ url_for('probe_egress') }}" class="actions-row egress-probe">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="next" value="{{ url_for('dashboard') }}">
+      <input name="host" value="1.1.1.1" placeholder="1.1.1.1" aria-label="探测主机">
+      <input name="port" type="number" min="1" max="65535" value="443" aria-label="探测端口">
+      <button class="btn btn-sm" type="submit">探测出口</button>
+    </form>
+    <a class="btn btn-ghost btn-sm" href="{{ url_for('egress_log_page') }}">访问流水</a>
+  </div>
+
+  <div class="card-head between egress-log-head">
+    <div>
+      <span class="kicker">最近流水</span>
+      <h3 class="card-title">最近的放行与拦截</h3>
+    </div>
+    <span class="egress-meta">
+      <span>放行 {{ eg_stats.get('allow')|default(0, true) }}</span>
+      <span>拦截 {{ eg_stats.get('block')|default(0, true) }}</span>
+      <span>合计 {{ eg_stats.get('total')|default(0, true) }}</span>
+    </span>
+  </div>
+
+  {% if egress_logs %}
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>时间</th>
+          <th>动作</th>
+          <th>域名</th>
+          <th>目标</th>
+          <th>端口</th>
+          <th>原因</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for row in egress_logs[:20] %}
+        {% set act = row.get('action', '') %}
+        <tr>
+          <td data-label="时间"><span class="mono">{{ row.get('at') or '-' }}</span></td>
+          <td data-label="动作">
+            <span class="pill {{ 'ok' if act == 'allow' else 'bad' }} no-dot">{{ '放行' if act == 'allow' else ('拦截' if act == 'block' else (act or '-')) }}</span>
+          </td>
+          <td data-label="域名">{{ row.get('domain') or '-' }}</td>
+          <td data-label="目标"><span class="mono">{{ row.get('ip') or '-' }}</span></td>
+          <td data-label="端口">{{ row.get('port') if row.get('port') is not none else 0 }}</td>
+          <td data-label="原因">{{ row.get('reason') or '-' }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="empty">
+    <h3>暂无出口访问流水</h3>
+    <p>放行或拦截发生后这里会出现采样记录（nft 限速采样，非全量审计）。</p>
+  </div>
+  {% endif %}
+</section>
+{% endif %}
+
 <section class="stats">
   <div class="stat">
     <span class="stat-label">当前模式</span>

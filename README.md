@@ -1,6 +1,6 @@
 # GOST SNI Manager
 
-GOST SNI Manager（简称 GSM）是一个用于中转 VPS 的轻量级 443 端口复用管理面板，支持 **自用模式** 和 **拼车模式** 两种运行方式。
+GOST SNI Manager（简称 GSM）是一个用于中转 VPS 的轻量级 443 端口复用管理面板，支持 **自用模式** 和 **拼车模式** 两种运行方式，并支持在落地/出口 VPS 上开启 **出口访问控制**（默认拒绝该机的出站连接，只放行白名单域名或临时全放开）。
 
 它让 **GOST 转发**、**Caddy 反代** 和 **REALITY 多落地分流** 共存：中转 VPS 只暴露一个 443 端口，GOST 根据落地 VPS 的 REALITY `SNI / serverName` 判断流量应该转发到哪台落地 VPS；没有命中已配置 SNI 的流量，则转发到本机 Caddy，由 Caddy 处理网站、面板或其他反代服务。
 
@@ -74,6 +74,15 @@ GOST SNI Manager（简称 GSM）是一个用于中转 VPS 的轻量级 443 端�
 - 可选配置面板域名；配置后由 Caddy 自动申请证书。
 - 登录信息保存到 `/root/gsm.txt`。
 
+### 出口访问控制（出口 VPS 专用）
+
+如果这台 VPS 是**落地/出口机**（客户端最终的出口），可以在安装时开启出口访问控制：对该机的**出站访问默认拒绝**，只在你明确放行时才允许连外网。
+
+- **默认拒绝**：关闭状态下，IPv4/IPv6 的出站连接（含 DNS）全部被丢弃。判定与强制都在常驻守卫里，不依赖面板/CLI 是否在场：面板停掉、数据库被删、守卫进程被杀，只要 nftables 表已经下发过，出站仍然是拒绝的。
+- **两种放行方式**：`allowlist`（只放行域名/IP 白名单）或 `all`（全部放行，相当于临时关闭拦截，但保留开关与流水）。
+- **为什么默认关闭**：普通中转 VPS 需要正常出站（GOST 连落地、Caddy 申请证书、apt 升级）。只有明确把这台机器当出口机时才需要拦出站，所以必须显式打开，避免把中转机的必要连接一起挡掉。
+- **和中转 VPS 的关系**：出口访问控制只运行在出口 VPS 上，管的是"这台机器能连出去什么"；中转 VPS 的 443 复用、SNI 分流、拼车中继等入站逻辑完全不受影响。普通中转 VPS 的安装默认**不安装、不启用**守卫。
+
 ## 工作原理
 
 ### 自用模式，默认
@@ -131,6 +140,7 @@ GOST：负责 443 SNI 分流
 GSM Panel：Flask + Gunicorn 管理面板
 Caddy：负责 fallback 网站/面板反代
 gsm-relay：仅拼车模式启用，用于统计流量和执行限速
+gsm-egress：仅出口 VPS 启用，负责出站访问控制的策略下发与流水记录（基于 nftables）
 ```
 
 大致资源占用如下，不同系统和版本会有差异：
@@ -194,6 +204,30 @@ http://中转VPS_IP:随机端口/
 
 这种方式更简单，但建议用防火墙限制访问来源，或者后续再配置面板域名。
 
+## 在出口 VPS 上安装（出口访问控制）
+
+普通中转 VPS 按上面的「一键安装」操作即可。如果这台机器是**落地/出口 VPS**，并且希望管住它的出站访问，安装时加 `GSM_EGRESS=1`：
+
+```bash
+GSM_EGRESS=1 bash <(curl -fsSL https://raw.githubusercontent.com/Qin52/realm-443/master/install.sh)
+```
+
+出口模式会额外做这些事：
+
+- 安装 `nftables` 依赖，并写入常驻守卫服务 `gsm-egress.service`（最后启动，避免挡住安装过程本身的必要出站）。
+- 如果**没有**显式设置 `GOST_LISTEN`，GOST 默认监听改为 `127.0.0.1:18443`，避免和出口机上已经占用 443 的 Xray REALITY 抢端口。需要改回其他地址时显式传入，例如：
+
+  ```bash
+  GSM_EGRESS=1 GOST_LISTEN=":443" bash <(curl -fsSL https://raw.githubusercontent.com/Qin52/realm-443/master/install.sh)
+  ```
+
+- 安装便携命令 `gsm`，并把出口状态和用法写入 `/root/gsm.txt`。
+- 首次安装后开关默认是**关闭**（出站全拒绝）；需要时登录面板或 SSH 执行 `gsm on` 打开。
+
+普通中转 VPS（不设置 `GSM_EGRESS`）的安装行为保持不变，**不安装守卫、不动 nftables**，面板里也不会出现出口访问卡片；`gsm` 命令仍会安装，但在没装守卫的机器上会明确提示"未启用出口守卫"并拒绝改策略，不会误配防火墙。如果检测到机器上已有 `gsm-egress.service`，会按"升级出口机"处理：刷新守卫程序与服务并保留已保存的策略（已打开的开关不会在升级时被改回关闭）。
+
+> 提示：安装过程中的 `apt`、下载 GOST/Caddy、申请证书都需要正常出站，所以守卫是**全部安装完成之后**才启动的。
+
 ## 安装完成后的信息
 
 安装结束后脚本会显示：
@@ -204,6 +238,8 @@ http://中转VPS_IP:随机端口/
 密码: 随机强密码
 登录信息已保存: /root/gsm.txt
 ```
+
+出口 VPS（`GSM_EGRESS=1`）还会额外提示出口访问控制的当前状态和 `gsm` 用法。
 
 如果没有配置面板域名，会显示类似：
 
@@ -363,6 +399,135 @@ https://aweb.example.com/
 
 如果账号过期、账号总流量用完、某条规则流量用完，相关转发会自动停止。
 
+## 出口访问控制使用方法
+
+出口访问控制只在通过 `GSM_EGRESS=1` 安装的出口 VPS 上出现。主账号登录面板后有两种操作方式，二者改的是同一份策略、走同一条判定逻辑。
+
+### 面板操作
+
+控制台（Dashboard）里有「出口访问」卡片，可以看到当前开关、模式、后端状态、最近流水，并完成：
+
+- **打开/关闭**：一键切换 `enabled`。关闭即出站全拒绝（含 DNS）。
+- **模式与白名单**：选择 `allowlist`（只放行白名单）或 `all`（全部放行），编辑域名/IP 白名单（每行一个），可同时设置 `block_quic`、`ipv6`。
+- **探测**：对指定 `host:port` 做一次 TCP 探测，验证当前策略下能不能连出去。
+- **重新下发**：手动让守卫把当前策略重新应用到 nftables（自愈用）。
+- **查看流水**：点击卡片里的入口进入 `/egress/log`，按放行/拦截筛选，查看最近的访问流水（默认 20 条，最多 2000 条，写入按 nft 限速采样，不是全量审计）。
+
+保存策略后面板会立即下发；如果下发失败，策略仍然保存，数据面会回落到"全拒绝"，卡片上会显示具体原因。
+
+> 子账号看不到也改不了出口开关，只有主账号可以操作。
+
+### 便携命令 gsm
+
+SSH 登录出口 VPS 后可以直接用 `gsm`，不需要进面板：
+
+| 命令 | 说明 |
+| --- | --- |
+| `gsm` / `gsm status` | 查看状态：开关、模式、域名数、数据面下发结果 |
+| `gsm on [--mode all\|allowlist] [--allow a.com,b.com]` | 打开出口访问。不写 `--mode` 时沿用当前模式；`--allow` 是逗号分隔的便利写法，先补域名再打开开关 |
+| `gsm off` | 关闭出口访问（关闭是默认态，关闭即出站全拒绝） |
+| `gsm allow a.com b.com` | 追加放行域名（不改开关状态；自动去重、排序后写回） |
+| `gsm deny a.com` | 删除放行域名（不改开关状态） |
+| `gsm domains` | 列出当前放行域名 |
+| `gsm test [host] [port]` | 出站连通性探测，默认 `1.1.1.1 443` |
+| `gsm log [-n N] [--allow\|--block]` | 查看访问流水（采样记录，非全量审计），`-n20` 这种粘连写法也支持 |
+| `gsm doctor` | 自检：守卫服务、nft 表、DNS、探测等 |
+| `gsm install-cli` | 把 `gsm` 安装到系统（需要 root） |
+| `gsm version` | 显示版本 |
+| `gsm help` | 显示帮助 |
+
+命令都有一到两个简写别名，例如 `gsm show` / `gsm enable` / `gsm disable` / `gsm remove` / `gsm list` / `gsm probe` / `gsm diag`。
+
+退出码与 `gsm` 调用到的面板子命令一致：`0` 成功；`1` 参数错误或本机未启用出口守卫；`3` 已保存但数据面下发失败。
+
+**未安装守卫时**的分工：`status` / `log` / `doctor` 退 `0`（只读，照常打印 `available=False`），`on` / `off` / `allow` / `deny` / `domains` 退 `1`（明确拒绝读改策略），`test` 探测不通退 `1`。
+
+补充几种常见情形：
+
+- `gsm doctor` 只在发现真错误时退 `1`，只有警告时退 `0`。
+- `gsm test <host> [port]` 默认探测 `1.1.1.1 443`，通退 `0`、不通退 `1`。
+- 参数错误一律退 `1`（与守卫是否可用无关），例如 `gsm on --mode bogus`、`gsm log -n 0`、未知子命令。
+- 退 `3` 时 `gsm` 会额外区分两种情况：`gsm on` 的第一步（写白名单）失败会提示"开关尚未改动，出口访问保持原状态"；改开关本身失败会提示"开关已改动（策略已保存），但数据面下发失败"。
+
+`gsm` 不依赖 tty、不依赖 `jq`，只用 bash 和系统自带命令，所以在最小化系统上也能直接跑。可用环境变量：
+
+```bash
+GSM_APP_DIR=/opt/gost-sni-manager   # 应用目录，默认就是它
+GSM_PYTHON=/opt/gost-sni-manager/venv/bin/python   # 指定解释器，默认按 venv → python3 → python 探测
+NO_COLOR=1                          # 关闭彩色输出
+```
+
+常用示例：
+
+```bash
+# 1) 打开白名单模式，并放行 GitHub 和 Debian apt 源
+gsm on
+gsm allow github.com deb.debian.org
+
+# 2) 临时全部放行（例如装软件、跑一次性脚本），完事再收回白名单
+gsm on --mode all
+gsm off
+
+# 3) 出问题时先自检，再看被拦截的流水
+gsm doctor
+gsm log -n 50 --block
+```
+
+说明：
+
+- 域名白名单按**解析出的 IP** 放行。守卫每 2 秒检查策略变化、并按 60 秒级 TTL 重新解析域名，DNS 记录变了会自动跟随，不需要手动重下发。
+- 打开且 `allowlist` 时，会额外放行到系统解析器（`/etc/resolv.conf` 里的 nameserver）的 53 端口，否则域名无法解析、白名单会把自己锁死；其他 53 目标仍然拒绝。关闭时 DNS 也拒绝。
+- 本机、内网、回环和已建立连接的流量永远放行。
+- `block_quic` 打开时会丢弃 UDP/443，逼客户端走 TCP，避免 QUIC 绕过基于 IP 的放行集合造成体验问题。
+- 放行/拦截日志由 nft 以 `limit rate 12/minute burst 6` 采样记录，高频访问只会看到采样样本。
+- `gsm on` 成功后会顺带打印一次状态；`gsm allow` / `gsm deny` 会回显最新的完整清单，方便直接核对。
+
+## 出口访问控制：行为与安全说明
+
+### 判定真值表
+
+| 开关 | 模式 | 域名匹配 | 结果 |
+| --- | --- | --- | --- |
+| 关闭 | 任意 | 任意 | 拒绝（出站全拒绝，含 DNS） |
+| 打开 | all | 任意 | 放行 |
+| 打开 | allowlist | 命中白名单 | 放行 |
+| 打开 | allowlist | 未命中 | 拒绝 |
+
+域名匹配大小写不敏感、按精确域名或子域（白名单写 `example.com` 同时覆盖 `*.example.com`），末尾的点会被忽略；白名单里也可以直接写 IPv4/IPv6 地址，这些地址不参与域名后缀匹配。
+
+### 数据面与失败安全
+
+- 强制点是 nftables：`table inet gsm_egress`（链 `gsm_out`）与 `table ip6 gsm_egress`（链 `gsm_out6`，`ipv6=0` 时不创建）。
+- 放行名单用 nft 集合（`allow4` / `allow6`）承载，域名解析成 IP 后热更新集合，不 reload 防火墙、不断已有连接，也不需要重启服务。
+- 每次下发都在一个 nft 事务里完成"删旧表 + 建新表"，失败整体回滚；下发后还会校验表和规则确实存在，校验不通过同样按失败处理。
+- **任何一次下发失败都会回落到全拒绝形态**：脚本先装拒绝形态再补放行规则，校验不通过也按失败处理，不会留下"表存在但链为空 = 放行"的中间状态。
+- **前提是表已经成功下发过一次**。nftables 规则不跨重启保留，且守卫启动前的窗口里没有表。所以：正常运行的机器上，守卫崩溃/重启期间出站仍然拒绝（表还在）；但机器刚开机、守卫还没跑起来的短暂窗口里，出站是放行的——这正是守卫 `Restart=always` 和安装器把它安排在最后启动的原因。
+- 守卫启动即下发一次，之后每 2 秒读一次策略、每 30 秒无条件校验表是否还在，缺失就重新下发（自愈）。
+- 面板与 `gsm` 命令用的是同一套策略逻辑和同一个下发入口，不会出现两套判定。
+
+### 流水与可观测性
+
+- 放行/拦截由内核日志记录，前缀分别是 `gsm-egress-allow:` 和 `gsm-egress-block:`，同一规则带 `limit rate 12/minute burst 6` 限速，避免高频流量刷爆内核日志。
+- 守卫从 `/dev/kmsg`（不可用时退回 `journalctl -k -f`）读取这些行，解析出目标 IP/端口/协议后写入 `egress_log` 表，只保留最近 2000 行（可用 `GSM_EGRESS_LOG_MAX` 调整）。
+- **流水是采样记录，不是全量审计**：被限速丢弃的日志行不会出现在流水里，流量统计不能以流水为准。
+
+### 恢复与排错
+
+```bash
+gsm doctor                    # 一键自检：服务、nft 表、策略、DNS、最近下发结果
+gsm off                       # 出问题时最直接的回退：恢复出站全拒绝
+journalctl -u gsm-egress -f   # 看守卫日志
+systemctl restart gsm-egress  # 重启守卫（启动时会重新下发一次策略）
+nft list table inet gsm_egress  # 直接看数据面规则
+```
+
+守卫进程挂掉（已经下发过一次的情况下）不影响拒绝本身：nft 表还在，出站仍然是拒绝的；此时面板和 SSH 仍然能进（本机/回环/已建立连接永远放行），可以登录上去 `systemctl restart gsm-egress` 或 `gsm off`。
+
+反过来说，**不要手工删表或 flush 链**：守卫每 30 秒会校验并重建，但在那之前出站是放行的窗口。机器重启后守卫会自动重新下发，规则不跨重启保留，这是 `Restart=always` 的作用。
+
+
+
+
 ## 面板操作逻辑
 
 ### 自用模式
@@ -491,6 +656,22 @@ cat /etc/gost/config.yaml
 ls -lh /etc/gost-panel/gsm.db
 ```
 
+查看出口访问状态（出口 VPS）：
+
+```bash
+gsm status
+gsm doctor
+```
+
+出口守卫服务与数据面：
+
+```bash
+systemctl status gsm-egress --no-pager
+journalctl -u gsm-egress -f
+nft list table inet gsm_egress
+nft list table ip6 gsm_egress
+```
+
 ## 常见问题
 
 ### 提示 curl: command not found
@@ -502,6 +683,48 @@ apt update && apt install -y curl ca-certificates
 ```
 
 然后再运行一键安装命令。
+
+### 打开出口访问后 apt / curl / git 不通
+
+这是预期行为：默认拒绝下所有未放行的出站（含 DNS）都会被丢弃。按需放行：
+
+```bash
+gsm allow deb.debian.org security.debian.org github.com
+gsm domains          # 确认白名单
+gsm test github.com 443
+```
+
+如果只是临时装东西，可以先 `gsm on --mode all`，装完再 `gsm off` 或切回 `allowlist`。
+
+注意：只放行域名不够时，还需要放行它实际连接的目标（CDN、对象存储、跳转后的镜像站等）。用 `gsm log --block` 看被拦截的目标，再决定是否放行。
+
+### 面板域名证书续期被挡
+
+Caddy 续期走的是 ACME（Let's Encrypt），需要从出口机出站到 `acme-v02.api.letsencrypt.org`。如果面板域名挂在出口 VPS 上，请在白名单里放行：
+
+```bash
+gsm allow acme-v02.api.letsencrypt.org
+```
+
+Caddy 可能还会用到 HTTP-01 校验的回连，以及 OCSP 查询；如果续期日志里出现其他被拦的域名，按 `gsm log` 里的拦截记录一并放行。实在赶时间可以先 `gsm on --mode all` 完成续期，再切回白名单。
+
+### 出口机重复安装/升级会不会把开关关掉
+
+不会。安装器对出口机是幂等的：重复执行或升级只会刷新守卫程序、服务与 `gsm` 命令，**保留数据库里已有的策略**。全新安装的默认状态是关闭；已经打开的机器升级后仍然保持打开（含白名单、模式、`block_quic`、`ipv6` 设置）。
+
+如果升级后想确认状态：
+
+```bash
+gsm status
+```
+
+### gsm 提示"未启用出口守卫"
+
+说明这台机器不是出口机（没有 `GSM_EGRESS=1` 安装，或者没有 `gsm-egress.service`）。`gsm` 会拒绝改策略、也不会碰 nftables。要在这台机器上启用出口访问控制，用出口模式重新安装：
+
+```bash
+GSM_EGRESS=1 bash <(curl -fsSL https://raw.githubusercontent.com/Qin52/realm-443/master/install.sh)
+```
 
 ### Caddy 源或 keyring 报错
 
@@ -522,7 +745,7 @@ apt update
 bash <(curl -fsSL https://raw.githubusercontent.com/Qin52/realm-443/master/uninstall.sh)
 ```
 
-卸载脚本会删除面板、数据库、GOST 配置和 systemd 服务，并询问是否删除 GOST 二进制和 Caddy 软件包。
+卸载脚本会删除面板、数据库、GOST 配置和 systemd 服务，在出口 VPS 上还会：停用并删除 `gsm-egress.service`、删除 nftables 表（`inet gsm_egress` 与 `ip6 gsm_egress`）、删除 `/usr/local/bin/gsm`。之后会询问是否删除 GOST 二进制和 Caddy 软件包。
 
 ## 注意事项
 
@@ -534,3 +757,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Qin52/realm-443/master/unins
 6. 自用模式性能最好，但不做限速和流量统计。
 7. 拼车模式支持限速和流量统计，但会多经过本机中继，高速大流量场景请给中转 VPS 留足 CPU 和内存。
 8. 如果未配置面板域名，面板会公网监听随机高位端口，建议使用防火墙限制来源 IP。
+9. 出口访问控制只装在使用 `GSM_EGRESS=1` 安装的出口 VPS 上，管的是该机的**出站**；中转 VPS 不要开启，否则会把 GOST 连落地、Caddy 申请证书等必要出站一起挡掉。
+10. 出口 VPS 的 GOST 默认监听 `127.0.0.1:18443`（避免和 443 上的 Xray REALITY 冲突）；如果你确实要它直接监听 443，安装时用 `GOST_LISTEN` 显式指定。
+11. 出口访问的开关状态保存在 SQLite（`/etc/gost-panel/gsm.db` 的 `egress_policy` 表），强制点在 nftables。不要手工 `nft flush` 或删除 `gsm_egress` 表：删掉表等于去掉拦截，守卫会在 30 秒内重建，但这段窗口是放行的；nft 规则也不跨重启保留，靠守卫启动时重新下发。
+12. 想临时停掉拦截用 `gsm off`（保留守卫服务、恢复默认拒绝），不要只 `systemctl stop gsm-egress`：守卫停了但表还在，出站仍然是拒绝的，此时改策略只能靠 `gsm`/面板重新下发，需要先 `systemctl restart gsm-egress`。彻底移除用卸载脚本。

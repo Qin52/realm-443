@@ -4,12 +4,16 @@ if [[ "${EUID}" -ne 0 ]]; then
   echo "请使用 root 执行：sudo bash uninstall.sh"
   exit 1
 fi
-systemctl stop gost-panel gsm-relay gost 2>/dev/null || true
-systemctl disable gost-panel gsm-relay gost 2>/dev/null || true
-rm -f /etc/systemd/system/gost-panel.service /etc/systemd/system/gsm-relay.service /etc/systemd/system/gost.service
+systemctl stop gost-panel gsm-relay gost gsm-egress 2>/dev/null || true
+systemctl disable gost-panel gsm-relay gost gsm-egress 2>/dev/null || true
+rm -f /etc/systemd/system/gost-panel.service /etc/systemd/system/gsm-relay.service /etc/systemd/system/gost.service /etc/systemd/system/gsm-egress.service
 systemctl daemon-reload
 systemctl reset-failed || true
-rm -rf /opt/gost-sni-manager /etc/gost-panel /etc/gost /root/gsm.txt /root/gost-panel-credentials.txt
+# 删除出口守卫的 nft 表；失败一律忽略：可能从未创建、nft 未安装或已由其他工具清理。
+nft delete table inet gsm_egress 2>/dev/null || true
+nft delete table ip6 gsm_egress 2>/dev/null || true
+rm -f /usr/local/bin/gsm
+rm -rf /opt/gost-sni-manager /etc/gost-panel /etc/gost /run/gsm-egress /root/gsm.txt /root/gost-panel-credentials.txt
 read -r -p "是否同时删除 /usr/local/bin/gost ? [y/N] " ans || true
 case "${ans:-}" in
   y|Y|yes|YES) rm -f /usr/local/bin/gost /usr/bin/gost ;;
