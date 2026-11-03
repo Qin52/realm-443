@@ -71,7 +71,13 @@ PRIVATE4 = (
     "255.255.255.255",
 )
 PRIVATE6 = ("::1", "fc00::/7", "fe80::/10", "ff00::/8")
-LOG_LIMIT = "limit rate 12/minute burst 6"
+# 真机证据（Debian 12 / nftables 1.0.6，每次清 conntrack，全新连接）：
+#   1) log prefix "x: " limit rate 12/minute burst 6 packets drop   -> verdict 失效，流量照常出去（危险）
+#   2) log prefix "x: " limit rate 12/minute burst 6 packets + 下一行独立 drop -> 连续 4 次全部被拒（采用）
+#   3) log prefix "x: " drop                                        -> 正常拦截
+# 铁律：limit 只能出现在【不带 verdict】的 log 规则里，verdict 必须独立成行。
+# 绝不要把 drop/accept 写在带 limit 的 log 规则上——那等于没有拦截。
+LOG_LIMIT = "limit rate 12/minute burst 6 packets"
 ALLOW_PREFIX = "gsm-egress-allow:"
 BLOCK_PREFIX = "gsm-egress-block:"
 DQ = chr(34)  # nft 规则里的引号，集中一处避免转义债
@@ -610,8 +616,25 @@ def _nft_set_block(name: str, set_type: str, elements: List[str]) -> List[str]:
     return lines
 
 
+def _log_line(prefix: str, with_limit: bool = False) -> str:
+    """生成一条【不带 verdict】的 log 规则（制表符缩进）。
+
+    nftables 1.0.6 实测：log 规则里一旦同时出现 limit 和 verdict（如
+    "log ... limit ... drop"），verdict 会失效、流量照常出去。所以 log 永远单独成行，
+    verdict 由紧随其后的独立规则负责。限速只加在拒绝日志上：放行日志量大，但白名单命中
+    本身已由 allow 集合收敛，拒绝日志才是高频来源。
+    """
+    line = "\t\tlog prefix " + DQ + prefix + " " + DQ
+    if with_limit and LOG_LIMIT:
+        line += " " + LOG_LIMIT
+    return line
+
+
 def _inet_table(policy: Dict[str, Any], allow4: List[str], dns4: List[str]) -> List[str]:
-    """IPv4 表：规则顺序严格按契约第 4 节，逐条生成。"""
+    """IPv4 表：规则顺序严格按契约第 4 节，逐条生成。
+
+    每条 log 与它的 verdict 拆成两条独立规则（见 _log_line 的真机证据）。
+    """
     enabled = bool(policy.get("enabled"))
     mode = str(policy.get("mode") or "allowlist").strip().lower()
     lines: List[str] = ["table inet gsm_egress {"]
@@ -624,8 +647,9 @@ def _inet_table(policy: Dict[str, Any], allow4: List[str], dns4: List[str]) -> L
     if enabled and bool(policy.get("block_quic", True)):
         lines.append("\t\tudp dport 443 drop")
     if not enabled:
-        # 关闭：集合为空，打拒绝日志并 drop（不引用 @allow4）。
-        lines.append("\t\tlog prefix " + DQ + BLOCK_PREFIX + " " + DQ + " " + LOG_LIMIT + " drop")
+        # 关闭：集合为空，拒绝日志（不带 verdict）+ 独立 drop，不引用 @allow4。
+        lines.append(_log_line(BLOCK_PREFIX, with_limit=True))
+        lines.append("\t\tdrop")
     elif mode == "all":
         lines.append("\t\taccept")
     else:
@@ -633,11 +657,10 @@ def _inet_table(policy: Dict[str, Any], allow4: List[str], dns4: List[str]) -> L
             target = "ip daddr { %s }" % ", ".join(dns4)
             lines.append("\t\t%s udp dport 53 accept" % target)
             lines.append("\t\t%s tcp dport 53 accept" % target)
-        lines.append(
-            "\t\tip daddr @allow4 log prefix " + DQ + ALLOW_PREFIX + " " + DQ
-            + " " + LOG_LIMIT + " accept"
-        )
-        lines.append("\t\tlog prefix " + DQ + BLOCK_PREFIX + " " + DQ + " " + LOG_LIMIT + " drop")
+        lines.append("\t\tip daddr @allow4 " + _log_line(ALLOW_PREFIX).strip())
+        lines.append("\t\taccept")
+        lines.append(_log_line(BLOCK_PREFIX, with_limit=True))
+        lines.append("\t\tdrop")
     lines.append("\t}")
     lines.append("}")
     return lines
@@ -657,7 +680,8 @@ def _ip6_table(policy: Dict[str, Any], allow6: List[str], dns6: List[str]) -> Li
     if enabled and bool(policy.get("block_quic", True)):
         lines.append("\t\tudp dport 443 drop")
     if not enabled:
-        lines.append("\t\tlog prefix " + DQ + BLOCK_PREFIX + " " + DQ + " " + LOG_LIMIT + " drop")
+        lines.append(_log_line(BLOCK_PREFIX, with_limit=True))
+        lines.append("\t\tdrop")
     elif mode == "all":
         lines.append("\t\taccept")
     else:
@@ -665,15 +689,13 @@ def _ip6_table(policy: Dict[str, Any], allow6: List[str], dns6: List[str]) -> Li
             target = "ip6 daddr { %s }" % ", ".join(dns6)
             lines.append("\t\t%s udp dport 53 accept" % target)
             lines.append("\t\t%s tcp dport 53 accept" % target)
-        lines.append(
-            "\t\tip6 daddr @allow6 log prefix " + DQ + ALLOW_PREFIX + " " + DQ
-            + " " + LOG_LIMIT + " accept"
-        )
-        lines.append("\t\tlog prefix " + DQ + BLOCK_PREFIX + " " + DQ + " " + LOG_LIMIT + " drop")
+        lines.append("\t\tip6 daddr @allow6 " + _log_line(ALLOW_PREFIX).strip())
+        lines.append("\t\taccept")
+        lines.append(_log_line(BLOCK_PREFIX, with_limit=True))
+        lines.append("\t\tdrop")
     lines.append("\t}")
     lines.append("}")
     return lines
-
 
 def nft_script(
     policy: Dict[str, Any],
@@ -688,8 +710,10 @@ def nft_script(
       （删除旧 ip6 表的逻辑由 apply 负责，见 _install_guard）；
     - 关闭时集合保持为空、以 drop 结束且完全不引用 @allow4；
     - 打开且 allowlist 时：先放行 resolv.conf 里的 DNS（UDP/TCP 53），再按 allow
-      集合打日志放行（limit rate 12/minute burst 6），未命中打日志并 drop；
-    - 打开且 all 时直接 accept（不打放行日志）。
+      集合打日志放行，未命中打日志并 drop；
+    - 打开且 all 时直接 accept（不打放行日志）；
+    - log 语句一律不带 limit：nftables 1.0.6 实测 "log ... limit ... drop" 的 verdict
+      会失效（流量照常出去），这是本模块最危险的一类回归，测试里有专门断言守着。
     """
     enabled = bool(policy.get("enabled"))
     values4 = _dedupe_sorted([str(item) for item in (allow4 or []) if str(item or "").strip()], 4) if enabled else []

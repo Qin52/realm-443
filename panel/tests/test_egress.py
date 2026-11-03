@@ -75,7 +75,8 @@ class FakeNft:
             if policy is not None and not egress._expects_drop(policy):
                 lines.append("\t\taccept")
             else:
-                lines.append('\t\tlog prefix "gsm-egress-block: " limit rate 12/minute burst 6 drop')
+                lines.append('\t\tlog prefix "gsm-egress-block: " limit rate 12/minute burst 6 packets')
+                lines.append("\t\tdrop")
             lines.append("\t}")
             lines.append("}")
             return (0, "\n".join(lines) + "\n", "")
@@ -146,6 +147,17 @@ def check(condition: bool, message: str) -> None:
 def body_lines(script: str) -> list:
     """去掉注释和空行后的脚本行。"""
     return [line for line in script.splitlines() if line.strip() and not line.strip().startswith("#")]
+
+
+def _bad_limit_lines(script: str) -> list:
+    """返回「带 limit 又自带 verdict」的 log 行（nft 1.0.6 会吞掉 verdict，属于缺陷写法）。"""
+    bad = []
+    for line in body_lines(script):
+        stripped = line.strip()
+        if stripped.startswith("log prefix") and "limit" in stripped:
+            if stripped.endswith(("drop", "accept")):
+                bad.append(stripped)
+    return bad
 
 
 def test_default_policy_and_schema_idempotent() -> None:
@@ -230,7 +242,8 @@ def test_truth_table() -> None:
     })
     check("ip daddr @allow4 log" in script, "allowlist 模式必须引用 @allow4")
     check("gsm-egress-allow:" in script and "gsm-egress-block:" in script, "两个日志前缀都要有")
-    check("limit rate 12/minute burst 6" in script, "日志必须限速")
+    check(_bad_limit_lines(script) == [], "limit 只能出现在不带 verdict 的 log 规则里：%s" % _bad_limit_lines(script))
+    _assert_log_verdict_pairs(script)
     check("drop" in script, "未命中必须 drop")
     print("ok 真值表四种组合")
 
@@ -292,8 +305,10 @@ def test_nft_script_order_and_content() -> None:
     quic = index_of(lambda l: l == "udp dport 443 drop")
     dns = index_of(lambda l: l.startswith("ip daddr { 1.1.1.1 } udp dport 53 accept"))
     allow = index_of(lambda l: l.startswith("ip daddr @allow4 log"))
+    allow_verdict = index_of(lambda l: l == "accept")
     deny = index_of(lambda l: l.startswith('log prefix "gsm-egress-block:'))
-    check(lo < private < established < quic < dns < allow < deny, "IPv4 规则顺序不对：%s" % lines)
+    check(lo < private < established < quic < dns < allow < allow_verdict < deny,
+          "IPv4 规则顺序不对：%s" % lines)
     for cidr in ("127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
                  "169.254.0.0/16", "100.64.0.0/10", "224.0.0.0/4", "255.255.255.255"):
         check(cidr in lines[private], "private4 缺 %s" % cidr)
@@ -304,10 +319,14 @@ def test_nft_script_order_and_content() -> None:
             break
     else:
         raise AssertionError("找不到 IPv6 内网放行规则")
-    check(lines[allow] == 'ip daddr @allow4 log prefix "gsm-egress-allow: " limit rate 12/minute burst 6 accept',
-          "allow 日志规则内容不对：%s" % lines[allow])
-    check(lines[deny] == 'log prefix "gsm-egress-block: " limit rate 12/minute burst 6 drop',
-          "拒绝规则内容不对：%s" % lines[deny])
+    check(lines[allow] == 'ip daddr @allow4 log prefix "gsm-egress-allow: "',
+          "allow 日志规则不得自带 verdict：%s" % lines[allow])
+    check(lines[allow_verdict] == "accept", "allow 日志后必须紧跟独立 accept：%s" % lines[allow_verdict])
+    check(lines[deny] == 'log prefix "gsm-egress-block: " limit rate 12/minute burst 6 packets',
+          "拒绝日志内容不对：%s" % lines[deny])
+    check(not lines[deny].rstrip().endswith(("drop", "accept")),
+          "带 limit 的 log 行绝不能自带 verdict（nft 1.0.6 会吞掉它）：%s" % lines[deny])
+    check(lines[deny + 1] == "drop", "拒绝日志后必须紧跟独立 drop：%s" % lines[deny:deny + 2])
     check("ip6 daddr @allow6 log" in script, "IPv6 表必须有 allow6 规则")
 
     # block_quic=0 时不得出现 QUIC drop；ipv6=0 时不得有 ip6 表。
@@ -323,6 +342,68 @@ def test_nft_script_order_and_content() -> None:
                             [], ["2001:db8::10"], [], []) .count("2001:db8::10") == 1,
           "IPv6 放行地址必须进 allow6 集合")
     print("ok nft_script 顺序与内容")
+
+
+def _assert_log_verdict_pairs(script: str) -> None:
+    """每条带 limit 的 log 行都必须紧跟一条独立的 verdict（契约第 4 节真机结论）。
+
+    nftables 1.0.6 上 "log ... limit ... packets <verdict>" 会吞掉 verdict（不拦截），
+    所以采用两规则写法：log 行不带 verdict，下一行独立 drop/accept。
+    """
+    lines = [line.strip() for line in body_lines(script)]
+    for index, line in enumerate(lines):
+        if not line.startswith("log prefix"):
+            continue
+        if line.endswith(("drop", "accept")):
+            # 不带 limit 的 log 可以直接带 verdict。
+            assert "limit" not in line, "带 verdict 的 log 行不得含 limit：%s" % line
+            continue
+        nxt = lines[index + 1] if index + 1 < len(lines) else ""
+        assert nxt in ("drop", "accept"), "log 行后面必须紧跟独立 verdict：%s -> %s" % (line, nxt)
+
+
+def test_log_verdict_regression() -> None:
+    """回归：nftables 1.0.6 上 "log ... limit ... drop" 的 verdict 会失效。
+
+    真机实测（Debian 12 / nftables 1.0.6）：
+      A) log prefix "a: " limit rate 12/minute burst 6 packets drop  -> 不拦截（流量照常出去）
+      B) log prefix "b: " limit rate 12/minute burst 6 packets + 独立 drop -> 连续 4 次全部拦截
+    因此采用两规则写法：带 limit 的 log 行【不带 verdict】，verdict 独立成行。
+    """
+    cases = [
+        {"enabled": False, "mode": "allowlist", "domains": [], "block_quic": True, "ipv6": True},
+        {"enabled": True, "mode": "allowlist", "domains": ["a.example.com"], "block_quic": True,
+         "ipv6": True, "allow4": ["203.0.113.10"], "dns4": ["1.1.1.1"]},
+        {"enabled": True, "mode": "all", "domains": [], "block_quic": True, "ipv6": True},
+        {"enabled": False, "mode": "all", "domains": [], "block_quic": False, "ipv6": False},
+    ]
+    for case in cases:
+        script = apply_policy(case)
+        # 任何带 limit 的 log 行都必须由下一条规则兜底，否则等于放行。
+        try:
+            _assert_log_verdict_pairs(script)
+        except AssertionError as exc:
+            check(False, str(exc))
+        for line in body_lines(script):
+            stripped = line.strip()
+            if stripped.startswith("log prefix") and stripped.endswith(("drop", "accept")):
+                check("limit" not in stripped, "log 行带 limit 时不得自带 verdict：%s" % stripped)
+
+    # 关闭态：最后一条判断规则必须是 drop，且不引用 @allow4（无任何旁路）。
+    script = apply_policy({"enabled": False, "mode": "allowlist", "domains": ["a.example.com"],
+                           "block_quic": True, "ipv6": True, "allow4": ["203.0.113.10"]})
+    inet = script.split("table ip6 gsm_egress")[0]
+    verdicts = [line.strip() for line in body_lines(inet)
+                if line.strip().endswith(("accept", "drop"))]
+    check(verdicts[-1] == "drop", "关闭态最后一条判断必须是 drop：%s" % verdicts[-1])
+    log_lines = [line.strip() for line in body_lines(inet) if line.strip().startswith("log prefix")]
+    check(log_lines and log_lines[-1] == 'log prefix "gsm-egress-block: " limit rate 12/minute burst 6 packets',
+          "关闭态必须是带 limit 的 log 行（不带 verdict）：%s" % log_lines)
+    check(not log_lines[-1].endswith(("drop", "accept")),
+          "带 limit 的 log 行绝不能自带 verdict：%s" % log_lines[-1])
+    check("@allow4" not in inet, "关闭态不得引用 @allow4")
+    check("elements" not in inet, "关闭态 allow 集合必须为空")
+    print("ok log 语句不带 limit 且紧跟 verdict（nft 1.0.6 回归）")
 
 
 def test_apply_success_writes_state() -> None:
@@ -752,6 +833,7 @@ def main() -> int:
     test_truth_table()
     test_normalize_and_parse_domains()
     test_nft_script_order_and_content()
+    test_log_verdict_regression()
     test_apply_success_writes_state()
     test_apply_failure_falls_back_to_deny()
     test_verify_rejects_missing_drop()

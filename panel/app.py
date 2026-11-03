@@ -12,6 +12,8 @@ from __future__ import annotations
 import argparse
 import functools
 import hashlib
+import html
+import ipaddress
 import json
 import os
 import random
@@ -73,6 +75,20 @@ APPLY_DELAY = float(os.environ.get("GOST_APPLY_DELAY", "2.5"))
 PANEL_DOMAIN = os.environ.get("PANEL_DOMAIN", "").strip().lower()
 CERT_DIR = Path(os.environ.get("GOST_CERT_DIR", "/root/cert"))
 
+# 面板开关与来源限制（契约 v3 第 2/3/4 节）。
+PANEL_CONF = Path(os.environ.get("GOST_PANEL_CONF", str(DATA_DIR / "panel.conf")))
+PANEL_SERVICE = os.environ.get("GSM_PANEL_SERVICE", "gost-panel")
+PANEL_DEFAULT_BIND = os.environ.get("GOST_PANEL_BIND", "127.0.0.1")
+PANEL_WILDCARD_BIND = "0.0.0.0"
+PANEL_REMOTE_DENIED_TEXT = "面板仅允许通过 SSH 隧道访问"
+PANEL_DISABLED_TEXT = "面板已关闭"
+# 本机网段：SSH 端口转发（含 -L 隧道、VNC 隧道）到达面板时 remote_addr 就是本机。
+LOCAL_TRUSTED_NETS = tuple(
+    ipaddress.ip_network(item)
+    for item in ("127.0.0.0/8", "::1/128")
+)
+_PANEL_ENABLED_LOCK = threading.Lock()
+
 # 出口访问控制（契约第 6/7/8 节）：面板侧提示与日志页上限。
 EGRESS_UNAVAILABLE_TEXT = "本机未启用出口访问守卫（未安装 gsm-egress 或 GSM_EGRESS 未开启），该功能不可用。"
 EGRESS_LOG_LIMIT_DEFAULT = 50
@@ -90,6 +106,230 @@ EGRESS_CLI_COMMANDS = (
 DOMAIN_RE = re.compile(r"^(?=.{1,253}$)([A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$")
 HOST_RE = re.compile(r"^[A-Za-z0-9.-]+$|^\[[0-9A-Fa-f:.]+\]$")
 LISTEN_RE = re.compile(r"^(:\d{1,5}|[A-Za-z0-9.:-]+:\d{1,5}|\[[0-9A-Fa-f:.]+\]:\d{1,5})$")
+
+
+# ---- 面板开关 / 来源闸门（契约 v3 第 3/4 节） ----
+
+
+def request_is_local() -> bool:
+    """请求是否来自本机（SSH 端口转发最终就是从本机进来的）。"""
+    candidates = [str(request.remote_addr or "")]
+    # 契约 v3 第 4 节：还要看 X-Forwarded-For（只有在本地反代/隧道下才有意义）。
+    forwarded = str(request.headers.get("X-Forwarded-For", "") or "")
+    if forwarded:
+        candidates.extend(part.strip() for part in forwarded.split(",") if part.strip())
+    for raw in candidates:
+        host = raw.strip()
+        if not host:
+            continue
+        if host.startswith("[") and host.endswith("]"):
+            host = host[1:-1]
+        # IPv6 的 zone id（fe80::1%eth0）不属于地址本身。
+        host = host.split("%", 1)[0]
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError:
+            continue
+        if any(address in net for net in LOCAL_TRUSTED_NETS):
+            return True
+    return False
+
+
+def panel_remote_allowed() -> bool:
+    """settings.panel_remote=1 时才额外放行公网来源（默认 0）。"""
+    return get_settings_flag("panel_remote", False)
+
+
+def panel_enabled() -> bool:
+    """面板开关状态（settings.panel_enabled，默认 1）。"""
+    return get_settings_flag("panel_enabled", True)
+
+
+def panel_remote_denied() -> bool:
+    """非本机且不允许远程时的统一判定。"""
+    return not request_is_local() and not panel_remote_allowed()
+
+
+def require_local_or_admin_tunnel() -> Optional[Response]:
+    """契约 v3 第 4 节来源闸门：非本机一律拒绝，返回 Response 或 None。
+
+    不满足时返回 403，并把提示放进 session 的 flash 队列
+    （403 本身不重定向，直接渲染 message.html 时也能读到这条提示）。
+    """
+    if not panel_remote_denied():
+        return None
+    flash(PANEL_REMOTE_DENIED_TEXT, "error")
+    return render_message_page(
+        "仅允许通过 SSH 隧道访问",
+        f"{PANEL_REMOTE_DENIED_TEXT}。请在本地电脑上执行 "
+        f"ssh -L {PANEL_PORT}:127.0.0.1:{PANEL_PORT} root@服务器地址，"
+        f"然后用浏览器打开 http://127.0.0.1:{PANEL_PORT}/ 。",
+        status=403,
+    )
+
+
+def render_message_page(title: str, message: str, status: int = 200) -> Response:
+    """极简提示页（不依赖模板文件，避免远程/关闭状态还要渲染完整布局）。"""
+    body = (
+        "<!doctype html>\n<html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
+        f"<title>{html.escape(title)}</title>"
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+        "<style>body{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;"
+        "background:#0f172a;color:#e2e8f0;display:flex;min-height:100vh;margin:0;"
+        "align-items:center;justify-content:center}"
+        ".card{background:#1e293b;border:1px solid #334155;border-radius:12px;"
+        "padding:32px 40px;max-width:560px;line-height:1.7}"
+        "h1{font-size:20px;margin:0 0 12px}p{margin:0;color:#cbd5e1;word-break:break-all}"
+        "</style></head><body><div class=\"card\">"
+        f"<h1>{html.escape(title)}</h1><p>{html.escape(message)}</p>"
+        "</div></body></html>"
+    )
+    return Response(body, status=status, mimetype="text/html; charset=utf-8")
+
+
+def require_local(func):
+    """来源闸门装饰器：登录页与登录后的敏感路由统一生效（契约 v3 第 4 节）。"""
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        denied = require_local_or_admin_tunnel()
+        if denied is not None:
+            return denied
+        return func(*args, **kwargs)
+    return wrapper
+
+
+def panel_disabled_notice() -> Optional[str]:
+    """面板已关闭时的页面提示（契约 v3 第 3 节：仍能启动，但只允许本机访问）。"""
+    if panel_enabled():
+        return None
+    return (
+        f"{PANEL_DISABLED_TEXT}：前端页面已通过指令关闭，端口映射等操作不可用（转发能力不受影响）。"
+        "在服务器上执行 python app.py panel-enable 或 gsm panel on 可重新打开。"
+    )
+
+
+def get_settings_flag(key: str, default: bool) -> bool:
+    """读 settings 里的布尔开关（0/1 文本）。"""
+    raw = str(get_setting(key, "1" if default else "0") or "").strip().lower()
+    return raw not in {"0", "false", "no", "off", ""}
+
+
+def set_settings_flag(key: str, value: bool) -> None:
+    set_setting(key, "1" if value else "0")
+
+
+def read_panel_conf() -> Dict[str, str]:
+    """读 panel.conf（BIND/PORT/ALLOW_REMOTE/ENABLED 键值文件，允许 # 注释）。"""
+    values: Dict[str, str] = {}
+    try:
+        text = PANEL_CONF.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return values
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        values[key.strip().upper()] = val.strip()
+    return values
+
+
+def write_panel_conf(bind: str, port: int, allow_remote: bool, enabled: bool) -> None:
+    """写 panel.conf；先读后写，保留文件里其他未知键，保证幂等。"""
+    known = {
+        "BIND": bind,
+        "PORT": str(int(port)),
+        "ALLOW_REMOTE": "1" if allow_remote else "0",
+        "ENABLED": "1" if enabled else "0",
+    }
+    extra: Dict[str, str] = {}
+    try:
+        for line in PANEL_CONF.read_text(encoding="utf-8").splitlines():
+            item = line.strip()
+            if not item or item.startswith("#") or "=" not in item:
+                continue
+            key, _, val = item.partition("=")
+            if key.strip().upper() not in known:
+                extra[key.strip().upper()] = val.strip()
+    except (OSError, UnicodeDecodeError):
+        pass
+    lines = ["# GOST SNI Manager 面板运行参数（由 app.py panel-* 与 gsm panel 维护）"]
+    for key in ("BIND", "PORT", "ALLOW_REMOTE", "ENABLED"):
+        lines.append(f"{key}={known[key]}")
+    for key, val in sorted(extra.items()):
+        lines.append(f"{key}={val}")
+    PANEL_CONF.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(PANEL_CONF, "\n".join(lines) + "\n", mode=0o644)
+
+
+def panel_conf_values() -> Dict[str, Any]:
+    """合并 panel.conf 与 settings 的当前值（settings 是面板内可改的那份）。"""
+    conf = read_panel_conf()
+    bind = conf.get("BIND") or PANEL_DEFAULT_BIND
+    try:
+        port = int(conf.get("PORT") or PANEL_PORT)
+    except ValueError:
+        port = PANEL_PORT
+    if "ALLOW_REMOTE" in conf:
+        allow_remote = conf["ALLOW_REMOTE"].strip().lower() not in {"0", "false", "no", "off", ""}
+    else:
+        allow_remote = get_settings_flag("panel_remote", False)
+    if "ENABLED" in conf:
+        enabled = conf["ENABLED"].strip().lower() not in {"0", "false", "no", "off", ""}
+    else:
+        enabled = get_settings_flag("panel_enabled", True)
+    return {
+        "bind": bind or PANEL_DEFAULT_BIND,
+        "port": port,
+        "allow_remote": allow_remote,
+        "enabled": enabled,
+        "updated_at": get_setting("panel_updated_at", ""),
+        "updated_by": get_setting("panel_updated_by", ""),
+    }
+
+
+def save_panel_state(actor: str = "", enabled: Optional[bool] = None,
+                     allow_remote: Optional[bool] = None,
+                     bind: Optional[str] = None, port: Optional[int] = None) -> Dict[str, Any]:
+    """把开关写进 settings 与 panel.conf（两者同步），返回写后的状态。幂等。"""
+    with _PANEL_ENABLED_LOCK:
+        current = panel_conf_values()
+        new_enabled = current["enabled"] if enabled is None else bool(enabled)
+        new_remote = current["allow_remote"] if allow_remote is None else bool(allow_remote)
+        new_bind = (bind or current["bind"] or PANEL_DEFAULT_BIND).strip()
+        if new_remote and new_bind in {"127.0.0.1", "localhost", "::1"}:
+            # 允许远程时必须真的监听出去，否则 SSH 隧道以外永远连不上。
+            new_bind = PANEL_WILDCARD_BIND
+        if not new_remote and new_bind in {PANEL_WILDCARD_BIND, "*"}:
+            new_bind = PANEL_DEFAULT_BIND
+        new_port = int(port or current["port"])
+        set_settings_flag("panel_enabled", new_enabled)
+        set_settings_flag("panel_remote", new_remote)
+        set_setting("panel_updated_at", utc_now())
+        set_setting("panel_updated_by", actor or "panel")
+        write_panel_conf(new_bind, new_port, new_remote, new_enabled)
+        state = panel_conf_values()
+        state.update({"enabled": new_enabled, "allow_remote": new_remote,
+                      "bind": new_bind, "port": new_port,
+                      "updated_by": actor or "panel", "updated_at": get_setting("panel_updated_at", "")})
+        return state
+
+
+def panel_status_text(state: Dict[str, Any]) -> str:
+    """panel-status 的纯文本输出（不跑 systemctl，那是 gsm 的职责）。"""
+    running = "应运行" if state["enabled"] else "已关闭（不该运行）"
+    remote = "允许远程" if state["allow_remote"] else "仅本机（SSH 隧道）"
+    lines = [
+        f"面板状态：{running}",
+        f"监听地址：{state['bind']}:{state['port']}",
+        f"来源限制：{remote}",
+        f"最近开关：{state.get('updated_at') or '（无记录）'}  操作者：{state.get('updated_by') or '（无记录）'}",
+        f"运行参数：{PANEL_CONF}",
+    ]
+    if not state["allow_remote"]:
+        lines.append(f"连接方式：ssh -L {state['port']}:127.0.0.1:{state['port']} root@服务器地址"
+                     f" 然后访问 http://127.0.0.1:{state['port']}/")
+    return "\n".join(lines)
 
 
 def egress_available() -> bool:
@@ -321,15 +561,26 @@ def create_app() -> Flask:
             "cert_status": cert_status,
             # 契约第 8 节：base.html 导航据此决定是否显示出口入口。
             "egress_available": egress_available(),
+            # 契约 v3：面板开关与来源状态（base.html 据此显示"面板已关闭"）。
+            "panel_enabled": panel_enabled(),
+            "panel_remote": panel_remote_allowed(),
+            "panel_notice": panel_disabled_notice(),
+            # 前端（dashboard.html）用这三个变量给出 SSH 隧道访问提示。
+            "panel_local": request_is_local(),
+            "panel_remote_allowed": panel_remote_allowed(),
+            "panel_port": PANEL_PORT,
         }
 
     @app.get("/login")
+    @require_local
     def login_page() -> str | Response:
         if is_logged_in():
             return redirect(url_for("dashboard"))
-        return render_template("login.html")
+        return render_template("login.html", panel_enabled=panel_enabled(),
+                               panel_notice=panel_disabled_notice())
 
     @app.post("/login")
+    @require_local
     def login_submit() -> Response | str:
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
@@ -348,14 +599,17 @@ def create_app() -> Flask:
         return redirect(url_for("dashboard"))
 
     @app.post("/logout")
+    @require_local
     @require_login
     @require_csrf
+    @require_panel_open
     def logout() -> Response:
         session.clear()
         flash("已退出登录。", "success")
         return redirect(url_for("login_page"))
 
     @app.get("/")
+    @require_local
     @require_login
     def dashboard() -> str:
         user = require_current_user()
@@ -383,11 +637,17 @@ def create_app() -> Flask:
             egress_state=egress_state_data(),
             egress_stats=egress_stats_data(),
             egress_logs=egress_logs_data(limit=20),
+            # 契约 v3：关闭时页面显示提示，前端据此隐藏操作入口。
+            panel_enabled=panel_enabled(),
+            panel_remote=panel_remote_allowed(),
+            panel_notice=panel_disabled_notice(),
         )
 
     @app.post("/rules")
+    @require_local
     @require_login
     @require_csrf
+    @require_panel_open
     def add_rule() -> Response:
         user = require_current_user()
         try:
@@ -412,8 +672,10 @@ def create_app() -> Flask:
         return redirect(url_for("dashboard"))
 
     @app.post("/rules/<rule_id>/update")
+    @require_local
     @require_login
     @require_csrf
+    @require_panel_open
     def update_rule(rule_id: str) -> Response:
         user = require_current_user()
         rule = get_rule(rule_id)
@@ -433,8 +695,10 @@ def create_app() -> Flask:
         return redirect(url_for("dashboard"))
 
     @app.post("/rules/<rule_id>/toggle")
+    @require_local
     @require_login
     @require_csrf
+    @require_panel_open
     def toggle_rule(rule_id: str) -> Response:
         user = require_current_user()
         rule = get_rule(rule_id)
@@ -451,8 +715,10 @@ def create_app() -> Flask:
         return redirect(url_for("dashboard"))
 
     @app.post("/rules/<rule_id>/delete")
+    @require_local
     @require_login
     @require_csrf
+    @require_panel_open
     def delete_rule(rule_id: str) -> Response:
         user = require_current_user()
         rule = get_rule(rule_id)
@@ -468,8 +734,10 @@ def create_app() -> Flask:
         return redirect(url_for("dashboard"))
 
     @app.post("/accounts")
+    @require_local
     @require_admin
     @require_csrf
+    @require_panel_open
     def add_account() -> Response:
         try:
             data = parse_account_form(request.form, new=True)
@@ -501,8 +769,10 @@ def create_app() -> Flask:
         return redirect(url_for("dashboard"))
 
     @app.post("/accounts/<user_id>/update")
+    @require_local
     @require_admin
     @require_csrf
+    @require_panel_open
     def update_account(user_id: str) -> Response:
         target = get_user(user_id)
         if not target or target["role"] == "admin":
@@ -533,8 +803,10 @@ def create_app() -> Flask:
         return redirect(url_for("dashboard"))
 
     @app.post("/accounts/<user_id>/reset-password")
+    @require_local
     @require_admin
     @require_csrf
+    @require_panel_open
     def reset_account_password(user_id: str) -> Response:
         target = get_user(user_id)
         if not target or target["role"] == "admin":
@@ -546,8 +818,10 @@ def create_app() -> Flask:
         return redirect(url_for("dashboard"))
 
     @app.post("/accounts/<user_id>/delete")
+    @require_local
     @require_admin
     @require_csrf
+    @require_panel_open
     def delete_account(user_id: str) -> Response:
         target = get_user(user_id)
         if not target or target["role"] == "admin":
@@ -564,8 +838,10 @@ def create_app() -> Flask:
         return redirect(url_for("dashboard"))
 
     @app.post("/settings")
+    @require_local
     @require_admin
     @require_csrf
+    @require_panel_open
     def update_settings() -> Response:
         try:
             listen = request.form.get("listen", "").strip() or DEFAULT_LISTEN
@@ -581,14 +857,31 @@ def create_app() -> Flask:
             set_setting("fallback_addr", fallback)
             set_setting("forwarding_mode", mode)
             apply_config(restart=True)
-            flash("基础设置已保存，配置将在几秒内自动生效。", "success")
+            # 契约 v3：表单出现 panel_* 字段时才改面板开关，避免漏字段把状态清空。
+            panel_changed = ""
+            if "panel_enabled" in request.form or "panel_remote" in request.form:
+                actor = get_current_user() or {}
+                state = save_panel_state(
+                    actor=str(actor.get("username", "") or "panel"),
+                    enabled=egress_form_bool("panel_enabled", panel_enabled())
+                    if "panel_enabled" in request.form else None,
+                    allow_remote=egress_form_bool("panel_remote", panel_remote_allowed())
+                    if "panel_remote" in request.form else None,
+                )
+                panel_changed = (
+                    f" 面板状态：{'开启' if state['enabled'] else '关闭'}，"
+                    f"{'允许远程' if state['allow_remote'] else '仅本机（SSH 隧道）'}。"
+                )
+            flash("基础设置已保存，配置将在几秒内自动生效。" + panel_changed, "success")
         except (ValueError, RuntimeError) as exc:
             flash(str(exc), "error")
         return redirect(url_for("dashboard"))
 
     @app.post("/apply")
+    @require_local
     @require_login
     @require_csrf
+    @require_panel_open
     def apply_now() -> Response:
         try:
             apply_config(restart=True)
@@ -598,11 +891,13 @@ def create_app() -> Flask:
         return redirect(url_for("dashboard"))
 
     @app.get("/config")
+    @require_local
     @require_admin
     def view_config() -> Response:
         return Response(generate_gost_config(), mimetype="text/plain; charset=utf-8")
 
     @app.get("/logs")
+    @require_local
     @require_login
     def logs() -> str:
         gost_logs = run_cmd(["journalctl", "-u", GOST_SERVICE, "-n", "120", "--no-pager"], allow_fail=True)[1]
@@ -613,8 +908,10 @@ def create_app() -> Flask:
     # ---- 出口访问控制（契约第 7 节）：全部主账号 + CSRF，失败都 flash 后重定向 ----
 
     @app.post("/egress/toggle")
+    @require_local
     @require_admin
     @require_csrf
+    @require_panel_open
     def toggle_egress() -> Response:
         guard = egress_guard_response()
         if guard is not None:
@@ -633,8 +930,10 @@ def create_app() -> Flask:
         return redirect(next_url)
 
     @app.post("/egress/settings")
+    @require_local
     @require_admin
     @require_csrf
+    @require_panel_open
     def update_egress() -> Response:
         guard = egress_guard_response()
         if guard is not None:
@@ -667,8 +966,10 @@ def create_app() -> Flask:
         return redirect(next_url)
 
     @app.post("/egress/probe")
+    @require_local
     @require_admin
     @require_csrf
+    @require_panel_open
     def probe_egress() -> Response:
         guard = egress_guard_response()
         if guard is not None:
@@ -701,6 +1002,7 @@ def create_app() -> Flask:
         return redirect(next_url)
 
     @app.get("/egress/log")
+    @require_local
     @require_admin
     def egress_log_page() -> str | Response:
         guard = egress_guard_response()
@@ -719,6 +1021,7 @@ def create_app() -> Flask:
         )
 
     @app.get("/egress/log.json")
+    @require_local
     @require_admin
     def egress_log_json() -> Response:
         guard = egress_guard_response()
@@ -736,8 +1039,10 @@ def create_app() -> Flask:
         return Response(json.dumps(payload, ensure_ascii=False), mimetype="application/json")
 
     @app.post("/egress/reapply")
+    @require_local
     @require_admin
     @require_csrf
+    @require_panel_open
     def reapply_egress() -> Response:
         guard = egress_guard_response()
         if guard is not None:
@@ -826,6 +1131,9 @@ def init_db() -> None:
         db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('fallback_addr',?)", (DEFAULT_FALLBACK,))
         db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('panel_domain',?)", (PANEL_DOMAIN,))
         db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('forwarding_mode', 'direct')")
+        # 契约 v3 第 3 节：面板默认开启、默认只允许本机（SSH 隧道）访问。
+        db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('panel_enabled','1')")
+        db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('panel_remote','0')")
         db.commit()
 
 
@@ -1218,6 +1526,21 @@ def require_csrf(func):
         token = request.form.get("csrf_token", "")
         if not token or token != session.get("csrf"):
             flash("页面已过期，请刷新后重试。", "error")
+            return redirect(url_for("dashboard"))
+        return func(*args, **kwargs)
+    return wrapper
+
+
+def require_panel_open(func):
+    """契约 v3 第 3 节：面板被指令关闭后，写操作一律拒绝（连本机也不行）。
+
+    只看不写的页面（控制台、日志、访问流水）仍可打开，方便从 SSH 隧道里查状态。
+    POST 才是改变端口映射/账号/出口的入口，所以闸门加在 POST 侧。
+    """
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        if not panel_enabled():
+            flash("面板已关闭，请先在服务器上执行 gsm panel on 打开后再操作。", "error")
             return redirect(url_for("dashboard"))
         return func(*args, **kwargs)
     return wrapper
@@ -2001,6 +2324,75 @@ def parse_init_rules(raw: str, owner_id: str) -> List[Dict[str, Any]]:
     return rules
 
 
+def reconcile_panel_state() -> Dict[str, Any]:
+    """确保 panel.conf 与 settings 一致：缺文件按 settings 生成，有文件则回写 settings。"""
+    state = panel_conf_values()
+    if not PANEL_CONF.is_file():
+        write_panel_conf(state["bind"], state["port"], state["allow_remote"], state["enabled"])
+    else:
+        set_settings_flag("panel_enabled", state["enabled"])
+        set_settings_flag("panel_remote", state["allow_remote"])
+    return state
+
+
+def panel_cli(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    """panel-enable / panel-disable / panel-status / panel-remote（契约 v3 第 3 节）。
+
+    只维护状态与 panel.conf，不执行 systemctl（服务启停是 gsm 的职责）。
+    退出码：0 表示应运行/操作成功，1 表示面板已关闭（仅 panel-status 会返回 1）。
+    """
+    command = args.command
+    want_json = bool(getattr(args, "json", False))
+    actor = str(getattr(args, "actor", "") or "gsm-cli")
+    reconcile_panel_state()
+    if command == "panel-enable":
+        state = save_panel_state(actor=actor, enabled=True)
+        code = 0
+        headline = "面板已开启（页面可操作，端口映射恢复网页管理）。"
+    elif command == "panel-disable":
+        state = save_panel_state(actor=actor, enabled=False)
+        code = 0
+        headline = ("面板已关闭（仅本机可访问且页面只读提示；GOST/出口/转发能力不受影响）。")
+    elif command == "panel-remote":
+        allow = bool(getattr(args, "on", False))
+        state = save_panel_state(actor=actor, allow_remote=allow)
+        code = 0
+        if allow:
+            headline = (f"警告：已允许公网直接访问面板（绑定 {state['bind']}）。"
+                        "强烈建议改回 panel-remote --off，只用 SSH 隧道。")
+            print(headline, file=sys.stderr)
+            headline = "已允许远程访问（绑定 0.0.0.0）。"
+        else:
+            headline = "已恢复仅本机访问（绑定 127.0.0.1），请使用 SSH 隧道。"
+            print(f"如需绑定立即生效：systemctl restart {PANEL_SERVICE}"
+                  "（本命令不代为执行 systemd 操作）。", file=sys.stderr)
+    elif command == "panel-status":
+        state = panel_conf_values()
+        code = 0 if state["enabled"] else 1
+        headline = ""
+    else:
+        parser.print_help()
+        return 1
+    if want_json:
+        payload = {
+            "ok": True,
+            "enabled": bool(state["enabled"]),
+            "should_run": bool(state["enabled"]),
+            "bind": state["bind"],
+            "port": int(state["port"]),
+            "allow_remote": bool(state["allow_remote"]),
+            "updated_at": state.get("updated_at") or "",
+            "updated_by": state.get("updated_by") or "",
+            "conf": str(PANEL_CONF),
+        }
+        print(json.dumps(payload, ensure_ascii=False))
+        return code
+    if headline:
+        print(headline)
+    print(panel_status_text(state))
+    return code
+
+
 def cli(argv: Optional[List[str]] = None) -> int:
     # 契约第 6 节：app.py 的 egress-* 只做参数转发，交给 egress.egress_cli()，
     # 转发前把命令名换成独立进程的写法（egress-show -> show）。
@@ -2017,8 +2409,12 @@ def cli(argv: Optional[List[str]] = None) -> int:
     sub = parser.add_subparsers(dest="command")
 
     serve = sub.add_parser("serve", help="run web panel")
-    serve.add_argument("--host", default=os.environ.get("GOST_PANEL_HOST", "127.0.0.1"))
-    serve.add_argument("--port", type=int, default=int(os.environ.get("GOST_PANEL_PORT", "7080")))
+    # 契约 v3 第 4 节：绑定地址由 panel.conf 决定，显式 --host/--port 仍然优先。
+    _conf = read_panel_conf() if PANEL_CONF.is_file() else {}
+    serve.add_argument("--host", default=os.environ.get("GOST_PANEL_HOST")
+                       or _conf.get("BIND") or PANEL_DEFAULT_BIND)
+    serve.add_argument("--port", type=int, default=int(os.environ.get("GOST_PANEL_PORT")
+                                                      or _conf.get("PORT") or PANEL_PORT))
 
     init = sub.add_parser("init", help="initialize admin account and state")
     init.add_argument("--username", required=True)
@@ -2030,12 +2426,37 @@ def cli(argv: Optional[List[str]] = None) -> int:
     init.add_argument("--mode", default=os.environ.get("GOST_FORWARD_MODE", "direct"), choices=["direct", "carpool"])
     init.add_argument("--force-auth", action="store_true")
 
+    panel_enable_cmd = sub.add_parser("panel-enable", help="enable the web panel (state + panel.conf)")
+    panel_enable_cmd.add_argument("--actor", default=os.environ.get("GSM_ACTOR", "gsm-cli"))
+    panel_enable_cmd.add_argument("--json", action="store_true")
+
+    panel_disable_cmd = sub.add_parser("panel-disable", help="disable the web panel (state + panel.conf)")
+    panel_disable_cmd.add_argument("--actor", default=os.environ.get("GSM_ACTOR", "gsm-cli"))
+    panel_disable_cmd.add_argument("--json", action="store_true")
+
+    panel_status_cmd = sub.add_parser("panel-status", help="print panel state (exit 0=running, 1=off)")
+    panel_status_cmd.add_argument("--json", action="store_true")
+
+    panel_remote_cmd = sub.add_parser("panel-remote", help="allow/deny non-local (public) panel access")
+    remote_group = panel_remote_cmd.add_mutually_exclusive_group(required=True)
+    remote_group.add_argument("--on", action="store_true", help="allow remote access (bind 0.0.0.0)")
+    remote_group.add_argument("--off", action="store_true", help="local only (bind 127.0.0.1)")
+    panel_remote_cmd.add_argument("--actor", default=os.environ.get("GSM_ACTOR", "gsm-cli"))
+    panel_remote_cmd.add_argument("--json", action="store_true")
+
     sub.add_parser("render-config", help="write gost config from database")
     sub.add_parser("show-config", help="print gost config")
 
     args = parser.parse_args(raw_args)
     init_db()
+    # 契约 v3 第 3 节：面板开关只改状态与 panel.conf，进程/服务启停归 gsm 负责。
+    if args.command in {"panel-enable", "panel-disable", "panel-status", "panel-remote"}:
+        return panel_cli(args, parser)
     if args.command == "serve":
+        if not panel_enabled():
+            # 契约 v3 第 3 节：关闭后进程仍可启动，页面只提示"面板已关闭"且仅本机可访问。
+            print(f"[warn] {PANEL_DISABLED_TEXT}：仅本机（SSH 隧道）可访问，"
+                  f"执行 python app.py panel-enable 重新打开。", file=sys.stderr)
         app = create_app()
         app.run(host=args.host, port=args.port)
         return 0

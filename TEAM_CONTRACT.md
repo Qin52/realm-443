@@ -81,7 +81,12 @@ updated_by    TEXT
   6. 若 enabled=1 且 mode=all：`accept`（结束）
   7. 若 enabled=1 且 mode=allowlist：`ip daddr @allow4 log limit... accept`（allow-log，见下），再 `drop`
   8. IPv6 链同构（用 `ip6 daddr` 与 `@allow6`，private6 覆盖 ::1、fc00::/7、fe80::/10、ff00::/8）。
-- 日志前缀（供第 5 节日志解析）：放行 `gsm-egress-allow:`，拒绝 `gsm-egress-block:`，同一条规则带 `limit rate 12/minute burst 6`，避免刷爆内核日志。all 模式不打放行日志；关闭状态打拒绝日志。
+- 日志前缀（供第 5 节日志解析）：放行 `gsm-egress-allow:`，拒绝 `gsm-egress-block:`。
+- **nft log 与 verdict 的硬约束（Debian 12 / nftables 1.0.6 真机实测）**：
+  - `log prefix "x" limit rate 12/minute burst 6 packets drop`（同一行带 verdict）**不会拦截**：limit 之后的 verdict 失效，流量照常放行，白名单/关闭态全部形同虚设。
+  - 正确写法是**两条规则**：先 `log prefix "x" limit rate 12/minute burst 6 packets`（不带 verdict，非终结），下一行独立 `drop`/`accept`。真机实测 4/4 全部拦截。
+  - 因此生成脚本里 `limit` 只允许出现在不带 verdict 的 log 行；每条 log 行后面必须紧跟独立的 verdict 行。
+- all 模式不打放行日志；关闭状态打拒绝日志。
 - 失败安全：
   - 任何一次下发失败，都必须回落到全拒绝形态（等价于 enabled=0 的规则），绝不允许出现表不存在/链为空导致流量自由出去的状态。
   - 下发方式：一次 `nft -f -` 事务内完成"删旧表+建新表"（表存在时脚本以 `delete table` 开头，同一事务原子替换，nft 失败即整体回滚，不留空窗）。
@@ -245,3 +250,61 @@ egress_logs = egress_log_tail(limit=20)
 ## 12. 版本
 
 APP_VERSION 升到 `2.3.0`（A2 负责）。
+
+# 契约 v3：SSH/VNC 专用面板控制（可开关前端 + 端口映射仅本机可管）
+
+v3 在 v2 基础上新增一项能力，其余约定不变（egress 相关全部继续有效）。
+
+## 1. 目标
+
+1. 面板（前端页面）可以通过**指令**随时开关：关闭后端口映射等功能无法从网页操作。
+2. 面板**只能从 SSH（含端口转发/VNC 隧道）访问**：不再对公网开放，不再依赖 Caddy 反代公网域名。
+3. 端口映射等敏感操作，在面板关闭或非本机来源时一律拒绝。
+
+## 2. 组件与命名
+
+| 名称 | 路径 | 职责 |
+| --- | --- | --- |
+| 面板开关命令 | gsm 的 `panel` 子命令（tools/gsm 内） | `gsm panel on/off/status`，直接操作 systemd 与绑定地址 |
+| 面板服务 | systemd 单元 gost-panel.service | 绑定地址由 /etc/gost-panel/panel.conf 决定 |
+| 运行参数文件 | /etc/gost-panel/panel.conf | 键值文件：BIND、PORT、ALLOW_REMOTE、ENABLED |
+| 数据库设置项 | settings 表：panel_enabled、panel_remote | 面板自身状态（与 panel.conf 同步，面板内可改） |
+| 面板内 CLI | python app.py panel-enable/panel-disable/panel-status [--json] | gsm panel 的底层实现 |
+| 来源闸门 | app.py 的 require_local_or_admin_tunnel() | 判定请求是否来自本机/SSH 隧道 |
+
+## 3. 面板开关语义
+
+- `gsm panel off`：
+  - 立即 `systemctl stop gost-panel`（并 `systemctl disable`，避免重启后自动起）；
+  - 写 settings.panel_enabled=0 与 /etc/gost-panel/panel.conf 的 ENABLED=0；
+  - **gost/gsm-egress/caddy 不受影响**，端口映射的转发能力继续工作（只是没有网页可改）。
+- `gsm panel on`：
+  - 写 ENABLED=1 / settings.panel_enabled=1，`systemctl enable --now gost-panel`；
+  - 绑定地址按第 4 节规则计算。
+- `gsm panel status`：输出 服务状态 / 监听地址 / 是否允许远程 / 最近一次开关时间与操作者；退出码 0（服务运行）/1（未运行）。
+- 开关必须幂等；重复 on/off 不报错。
+
+## 4. 绑定与来源限制（默认只允许本机）
+
+- **默认绑定 127.0.0.1**（不再 0.0.0.0）。远程管理请用 SSH 端口转发：
+  `ssh -L 7080:127.0.0.1:7080 root@中转VPS`，然后本机浏览器访问 http://127.0.0.1:7080/。
+- `gsm panel remote on`：显式允许公网监听（0.0.0.0），必须打印醒目警告；`gsm panel remote off` 恢复 127.0.0.1。
+- 即使绑定 0.0.0.0，`ALLOW_REMOTE=0` 时 app.py 也要拒绝**非本机且非隧道**来源的登录与端口映射操作：
+  - 判定：`request.remote_addr` 属于 127.0.0.0/8、::1 视为本机；否则再看 `X-Forwarded-For`/直连是否来自本机。
+  - 拒绝时返回 403 并 flash「面板仅允许通过 SSH 隧道访问」。
+
+## 5. 环境变量与安装器
+
+- install.sh 新增 `PANEL_BIND`（默认 127.0.0.1）与 `PANEL_ALLOW_REMOTE`（默认 0），并写入 /etc/gost-panel/panel.conf。
+- 面板域名（PANEL_DOMAIN）模式改为「可选的高级用法」：即使配了域名，Caddy 站点也 `bind 127.0.0.1`（现状已如此），文档要写清「域名也要经 SSH 隧道才能访问」。
+- 安装完成提示里必须给出 SSH 隧道命令示例。
+- uninstall.sh 删除 /etc/gost-panel/panel.conf。
+
+## 6. 验收
+
+- 真机（测试服务器）：
+  1. `gsm panel off` 后 `systemctl is-active gost-panel` = inactive，且 22/443 等业务不受影响；
+  2. `gsm panel on` 后面板只监听 127.0.0.1；
+  3. 从公网直连面板端口应连接被拒（未监听 0.0.0.0）；
+  4. 通过 SSH 隧道访问返回 200（登录页）。
+- 本地单测：panel.conf 读写、gsm panel 三个子命令的幂等与退出码、app.py 的来源闸门。

@@ -13,6 +13,9 @@ systemctl reset-failed || true
 nft delete table inet gsm_egress 2>/dev/null || true
 nft delete table ip6 gsm_egress 2>/dev/null || true
 rm -f /usr/local/bin/gsm
+# 契约 v3 第 5 节：面板运行参数单独删一遍（/etc/gost-panel 整体删除已覆盖，
+# 这里保留显式删除，防止将来该目录被保留时留下悬空的 BIND/ENABLED 配置）。
+rm -f /etc/gost-panel/panel.conf
 rm -rf /opt/gost-sni-manager /etc/gost-panel /etc/gost /run/gsm-egress /root/gsm.txt /root/gost-panel-credentials.txt
 read -r -p "是否同时删除 /usr/local/bin/gost ? [y/N] " ans || true
 case "${ans:-}" in

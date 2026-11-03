@@ -3,6 +3,30 @@
 {% set carpool = settings.forwarding_mode == 'carpool' %}
 {% block content %}
 
+{% if is_admin %}
+{# 面板访问提示（契约 v3）：默认只监听 127.0.0.1，远程一律走 SSH 隧道 #}
+{% set panel_port_value = panel_port|default(default_port)|default(7080, true) %}
+{% set panel_local_flag = panel_local if panel_local is defined else true %}
+{% set panel_remote_flag = panel_remote_allowed if panel_remote_allowed is defined else false %}
+<div class="banner">
+  <div>
+    面板默认只监听 <code>127.0.0.1</code>，不对外网开放。远程管理请先建 SSH 隧道：
+    <code class="mono">ssh -L {{ panel_port_value }}:127.0.0.1:{{ panel_port_value }} root@&lt;服务器IP&gt;</code>，
+    然后在浏览器打开 <code class="mono">http://127.0.0.1:{{ panel_port_value }}/</code>。
+    <br>
+    当前来源：
+    {% if panel_local_flag %}
+    <span class="pill ok">本机 / SSH 隧道</span>
+    {% elif panel_remote_flag %}
+    <span class="pill warn">公网直连（已显式允许）</span>
+    {% else %}
+    <span class="pill bad">非本机来源</span>
+    <span class="hint">端口映射等敏感操作会被拒绝，请改用 SSH 隧道；开关面板在服务器执行 <code class="mono">gsm panel off</code> / <code class="mono">gsm panel on</code>。</span>
+    {% endif %}
+  </div>
+</div>
+{% endif %}
+
 <div class="page-head">
   <div class="grow">
     <h1 class="page-title">{{ '控制台' if is_admin else '我的转发规则' }}</h1>
