@@ -305,9 +305,8 @@ def test_nft_script_order_and_content() -> None:
     quic = index_of(lambda l: l == "udp dport 443 drop")
     dns = index_of(lambda l: l.startswith("ip daddr { 1.1.1.1 } udp dport 53 accept"))
     allow = index_of(lambda l: l.startswith("ip daddr @allow4 log"))
-    allow_verdict = index_of(lambda l: l == "accept")
     deny = index_of(lambda l: l.startswith('log prefix "gsm-egress-block:'))
-    check(lo < private < established < quic < dns < allow < allow_verdict < deny,
+    check(lo < private < established < quic < dns < allow < deny,
           "IPv4 规则顺序不对：%s" % lines)
     for cidr in ("127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
                  "169.254.0.0/16", "100.64.0.0/10", "224.0.0.0/4", "255.255.255.255"):
@@ -319,9 +318,9 @@ def test_nft_script_order_and_content() -> None:
             break
     else:
         raise AssertionError("找不到 IPv6 内网放行规则")
-    check(lines[allow] == 'ip daddr @allow4 log prefix "gsm-egress-allow: "',
-          "allow 日志规则不得自带 verdict：%s" % lines[allow])
-    check(lines[allow_verdict] == "accept", "allow 日志后必须紧跟独立 accept：%s" % lines[allow_verdict])
+    # allow 分支必须 log + verdict 同一行：log 是非终结语句，verdict 拆行会放行全部流量。
+    check(lines[allow] == 'ip daddr @allow4 log prefix "gsm-egress-allow: " accept',
+          "allow 规则必须是 log + accept 同一行：%s" % lines[allow])
     check(lines[deny] == 'log prefix "gsm-egress-block: " limit rate 12/minute burst 6 packets',
           "拒绝日志内容不对：%s" % lines[deny])
     check(not lines[deny].rstrip().endswith(("drop", "accept")),

@@ -657,8 +657,10 @@ def _inet_table(policy: Dict[str, Any], allow4: List[str], dns4: List[str]) -> L
             target = "ip daddr { %s }" % ", ".join(dns4)
             lines.append("\t\t%s udp dport 53 accept" % target)
             lines.append("\t\t%s tcp dport 53 accept" % target)
-        lines.append("\t\tip daddr @allow4 " + _log_line(ALLOW_PREFIX).strip())
-        lines.append("\t\taccept")
+        # allow 分支必须「log + verdict 同一行」：log 是 non-terminating 语句，
+        # 若把 verdict 拆到下一行，spectre 之后的裸 accept 会放行全部流量（真机复现过）。
+        # 这条 log 不带 limit，所以不会吞 verdict。
+        lines.append("\t\tip daddr @allow4 " + _log_line(ALLOW_PREFIX).strip() + " accept")
         lines.append(_log_line(BLOCK_PREFIX, with_limit=True))
         lines.append("\t\tdrop")
     lines.append("\t}")
@@ -689,8 +691,8 @@ def _ip6_table(policy: Dict[str, Any], allow6: List[str], dns6: List[str]) -> Li
             target = "ip6 daddr { %s }" % ", ".join(dns6)
             lines.append("\t\t%s udp dport 53 accept" % target)
             lines.append("\t\t%s tcp dport 53 accept" % target)
-        lines.append("\t\tip6 daddr @allow6 " + _log_line(ALLOW_PREFIX).strip())
-        lines.append("\t\taccept")
+        # 同 IPv4：allow 分支必须 log + verdict 同一行。
+        lines.append("\t\tip6 daddr @allow6 " + _log_line(ALLOW_PREFIX).strip() + " accept")
         lines.append(_log_line(BLOCK_PREFIX, with_limit=True))
         lines.append("\t\tdrop")
     lines.append("\t}")
