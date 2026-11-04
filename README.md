@@ -1,6 +1,6 @@
 # GOST SNI Manager
 
-##该项目由https://github.com/ddminxx/gost-sni-manager修改而来
+该项目由 https://github.com/ddminxx/gost-sni-manager 修改而来
 
 GOST SNI Manager（简称 GSM）是一个用于中转 VPS 的轻量级 443 端口复用管理面板，支持 **自用模式** 和 **拼车模式** 两种运行方式，并支持在落地/出口 VPS 上开启 **出口访问控制**（默认拒绝该机的出站连接，只放行白名单域名或临时全放开）。
 
